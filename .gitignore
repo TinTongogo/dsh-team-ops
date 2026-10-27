@@ -1,0 +1,7 @@
+.DS_Store
+node_modules/
+.company-gate.*.json
+docs/orchestrator/reports/*.visual-check.1*.png
+docs/orchestrator/reports/*.visual-check.2*.png
+# 项目级技能根（使用者在工作区里装的技能是你的数据，不进仓库）
+.dsh/

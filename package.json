@@ -1,0 +1,58 @@
+{
+	"name": "dsh-team-ops",
+	"version": "0.17.1",
+	"description": "一人公司团队插件：一次安装把整支角色团队交付进 DSH —— 角色清单现场枚举 `team/roles/<id>/ROLE.md`（包内 19 个 + 你的用户角色根）、一块任务看板（CAS 版本号 + 执行代凭据）、名册 / 邮箱 / 人的话这些纯文本状态，以及对话页里的一个「团队状态」栏（成员 / 技能 / 任务看板三块）与输入框那枚「角色」按钮。不注册预设、不往技能注册表里加东西。",
+	"type": "module",
+	"exports": {
+		".": "./lib/board-view.host.js",
+		"./cordis.patch.yml": "./cordis.patch.yml",
+		"./host": "./lib/board-view.host.js",
+		"./client": {
+			"default": "./lib/board-view.client.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"cordis.patch.yml",
+		"lib",
+		"team",
+		"README.md"
+	],
+	"engines": {
+		"node": "^22.19.0 || >=24.0.0"
+	},
+	"license": "MIT",
+	"keywords": [
+		"deepseek-harness",
+		"dsh",
+		"dsh-plugin",
+		"dsh-bundle",
+		"agent-presets",
+		"skills",
+		"team",
+		"orchestrator",
+		"agent-teams",
+		"multi-agent",
+		"one-person-company"
+	],
+	"dsh": {
+		"bundle": {
+			"patch": "./cordis.patch.yml"
+		},
+		"client": {
+			"platform": "web",
+			"immediately": true,
+			"inject": [
+				"@deepseek-ai/dsh-client-ui-conversation"
+			]
+		}
+	},
+	"scripts": {
+		"test": "node --test \"tests/*.test.mjs\"",
+		"verify": "node tests/verify.mjs",
+		"roster": "node tests/roster.mjs",
+		"roster:write": "node tests/roster.mjs --write",
+		"role:new": "node tests/roster.mjs --new",
+		"roster:list": "node tests/roster.mjs --list"
+	}
+}

@@ -1,0 +1,66 @@
+# dsh-team-ops —— 插件唯一的接线层：两次 insert（看板前端页的宿主行 + 文件状态注入钩子）。
+#
+# **既没有预设层、也不注册技能**：团队能力（制度层 / 运行时层 / 团队工具与策略段）全部随
+# **插件**装载；角色名册与基线全文在包内**按路径读**（`team/roles/` 与 `team/BASELINE.md`）
+# —— 装插件即有，与"会话选了哪个预设"无关，技能表里也不会多出本包的东西。
+#
+# ── 看板前端页的宿主行 ───────────────────────────────────────────────────────
+#
+# 指向本包的 loader entry 全局只能有一条。`ClientModuleRegistry.resolveSource()` 把每个 entry 解析到
+# 它最近的祖先 `package.json`；那个包声明了 `dsh.client` 时，这个 entry 就成为它的一条「客户端来源」，
+# 而 `reconcilePackage()` 在 sources.length > 1 时直接抛错：
+#
+#   client-modules: package dsh-team-ops resolves from multiple active Loader sources: …; remove one entry
+#
+# 这一行同时是浏览器半边的入口：登记会顺着它找到本包，读到 `dsh.client` 与 `exports["./client"]`，
+# 把 lib/board-view.client.js 组合进 web shell。启动自诊断也并进这一条执行
+# （lib/diagnose.js 不再单独插入，也不出现在任何 patch 里）。
+#
+# name 必须是不带子路径的精确包名（即本包名，它的 exports["."] 指向 host 半边）。客户端的登记表
+# 对 entry 名只认两种写法：路径形态（./x、/abs/x、file:）或精确包名；写成「包名/子路径」会在
+# exactPackageSpecifier 处判成非包名而被静默跳过 —— 宿主半边照常装载、三栏全部消失，且没有任何日志。
+# 相对路径同样不行：解析基准是 profile 目录，./lib/... 会指到 profile 根下。
+# 使用方不要再往 profile 的 cordis.patch.yml 里加指向本包的行 —— 那是第二条 entry，组装 web shell
+# 时会直接抛上面那条错。
+#
+# 缺 config 时：三栏按当前会话的工作目录取；会话工作目录也取不到时，三个端点返回 503 并说明该配
+# 哪个键。要固定一个工作区，就把下面那行换成 config.workspace: '/绝对路径'。
+#   只读：不写工作区里的那些状态文件、不改状态、不删文件。
+
+- insert:
+    - id: company-board
+      name: 'dsh-team-ops'
+
+    # ── 文件状态注入钩子（每个会话各自的工作目录）────────────────────────────
+    #
+    # 文件是状态的唯一真相源，而引擎只写文件、不会把变化推给会话：人在两次发言之间点了批准，
+    # 会话手里那份读数就已经过期且没有任何提示。这一行把 DSH 自带的 Claude Code hook 桥接装上，
+    # 让 `lib/ledger-digest.js`（只读摘要）在 `UserPromptSubmit` 与 `SessionStart` 两个事件上
+    # 把文件当前状态注进上下文 —— 状态自己进来，不靠会话记得重读。
+    #
+    # **为什么现在能搬到宿主层**（原来写在预设里，理由是"宿主层的行是进程级单例、会读错工作区"）：
+    # 桥接自己**按事件取工作目录** —— 它 lib 里就是 `cwd: agent?.session.header.cwd ?? process.cwd()`
+    # ⇒ 每个会话拿到的是**自己**那个工作目录，与这一行挂在哪一层无关。当初那条理由不成立。
+    # `configPath` 指向本包那份钩子配置（`lib/hooks.claude-code.json`），`pluginRoot` 是解析命令的根。
+    # 这两个路径**必须绝对**（桥接自己一进程只读一次配置文件），所以与技能根同一套候选算法。
+    - id: team-ops-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: !!js >-
+          (() => { const fs = process.getBuiltinModule('node:fs'); const p = process.getBuiltinModule('node:path'); const os = process.getBuiltinModule('node:os'); const url = process.getBuiltinModule('node:url'); const req = process.getBuiltinModule('node:module').createRequire; const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : p.join(os.homedir(), '.dsh'); const rel = p.join('lib', 'ledger-digest.js'); const cands = []; try { cands.push(url.fileURLToPath(new URL('./', baseUrl))); } catch (e) {} try { cands.push(url.fileURLToPath(new URL('../../', baseUrl))); } catch (e) {} try { cands.push(p.dirname(req(baseUrl).resolve('dsh-team-ops/package.json'))); } catch (e) {} try { for (const n of fs.readdirSync(p.join(home, 'profiles'))) cands.push(p.join(home, 'profiles', n, 'node_modules', 'dsh-team-ops')); } catch (e) {} const ok = (c) => { try { return fs.existsSync(p.join(c, rel)); } catch (e) { return false; } }; const found = cands.find(ok); return p.join(found || p.join(home, 'nonexistent-team-ops'), 'lib', 'hooks.claude-code.json'); })()
+        pluginRoot: !!js >-
+          (() => { const fs = process.getBuiltinModule('node:fs'); const p = process.getBuiltinModule('node:path'); const os = process.getBuiltinModule('node:os'); const url = process.getBuiltinModule('node:url'); const req = process.getBuiltinModule('node:module').createRequire; const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : p.join(os.homedir(), '.dsh'); const rel = p.join('lib', 'ledger-digest.js'); const cands = []; try { cands.push(url.fileURLToPath(new URL('./', baseUrl))); } catch (e) {} try { cands.push(url.fileURLToPath(new URL('../../', baseUrl))); } catch (e) {} try { cands.push(p.dirname(req(baseUrl).resolve('dsh-team-ops/package.json'))); } catch (e) {} try { for (const n of fs.readdirSync(p.join(home, 'profiles'))) cands.push(p.join(home, 'profiles', n, 'node_modules', 'dsh-team-ops')); } catch (e) {} const ok = (c) => { try { return fs.existsSync(p.join(c, rel)); } catch (e) { return false; } }; return cands.find(ok) || p.join(home, 'nonexistent-team-ops'); })()
+
+    # ── 团队能力（制度层 + 运行时层）：**由本行自己装载，不新增 loader entry** ──────
+    #
+    # 想要的效果（人的要求）：「我不要预设可不可以？只装插件能力」。做法写在 `lib/board-view.host.js`：
+    # 这一条宿主行在服务就绪后**自己 apply** 那两个引擎（`team/company-gate.js` 与
+    # `team-runtime.js`），于是团队工具与那段策略段随**插件**装载，与跑哪个预设无关。
+    #
+    # **为什么不在这里插两条 entry**（第一版就是这么写的，现场直接把 DSH 启崩了）：
+    #   client-modules: package dsh-team-ops resolves from multiple active Loader sources:
+    #     "…/node_modules/dsh-team-ops/team/company-gate.js" …
+    # 宿主那套 `ClientModuleRegistry` 按**最近的 `package.json`** 给每条 entry 归属：本包声明了
+    # `dsh.client`，于是任何指向包内文件的 entry 也算本包的一条"客户端来源"，多一条就 Fatal
+    # （`reconcilePackage()`：sources.length > 1 直接抛）。**指向同一个包的 entry 只能有一条** ——
+    # 这条纪律对"宿主行"与"客户端来源"是同一个判定，别想着"再多插一行只是多挂个插件"。
