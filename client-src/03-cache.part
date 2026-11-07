@@ -1,0 +1,56 @@
+		// ── ③ 取数缓存与 URL ───────────────────────────────────────────────
+		const PANE_TTL_MS = 3000
+		/** 缓存里最多留几份载荷：切会话会不断生成新 key，不设上限就常驻整份面板数据。 */
+		const PANE_CACHE_MAX = 32
+		const paneCache = new Map()
+		/** 让缓存失效（写动作之后、刷新 tick 时调）。 */
+		const invalidatePanes = () => paneCache.clear()
+		/** 写入时顺手清掉过期的，再按插入顺序把最老的挤出去；不额外起定时器。 */
+		const prunePaneCache = () => {
+			const now = Date.now()
+			for (const [key, value] of paneCache) {
+				if (now - value.at >= PANE_TTL_MS) paneCache.delete(key)
+			}
+			while (paneCache.size > PANE_CACHE_MAX) paneCache.delete(paneCache.keys().next().value)
+		}
+		/**
+		 * 取一个读端点的 JSON：命中未过期的缓存就直接给，否则真发一次并记下来。
+		 * 返回的形状与 `fetch` 一样（调用方要用 `response.status`），失败照常 reject（调用方自己兜）。
+		 */
+		const getJsonCached = (url, { force = false, headers } = {}) => {
+			const hit = paneCache.get(url)
+			if (force !== true && hit !== undefined && Date.now() - hit.at < PANE_TTL_MS) {
+				return Promise.resolve({ ok: hit.status < 400, status: hit.status, fromCache: true, json: async () => hit.payload })
+			}
+			return fetch(url, { headers: headers === undefined ? { accept: 'application/json' } : headers, credentials: 'same-origin' }).then((response) =>
+				response.json().then(
+					(payload) => {
+						paneCache.set(url, { at: Date.now(), status: response.status, payload })
+						prunePaneCache()
+						// 返回合成的 response（原 response 的 body 已被消费，再读会抛）；合成对象只实现 `status` 与 `json()`。
+						return { ok: response.status < 400, status: response.status, fromCache: false, json: async () => payload }
+					},
+					() => response,
+				),
+			)
+		}
+
+		const paneQueryOf = (workspace, sessionId) => {
+			const parts = []
+			if (workspace !== '') parts.push('workspace=' + encodeURIComponent(workspace))
+			if (sessionId !== '') parts.push('session=' + encodeURIComponent(sessionId))
+			return parts.length === 0 ? '' : '?' + parts.join('&')
+		}
+		const membersUrlOf = (workspace, sessionId) => MEMBERS_ENDPOINT + paneQueryOf(workspace, sessionId)
+		const teamTasksUrlOf = (workspace, sessionId) => TEAM_TASKS_ENDPOINT + paneQueryOf(workspace, sessionId)
+		const collabUrlOf = (workspace, sessionId) => COLLAB_ENDPOINT + paneQueryOf(workspace, sessionId)
+		const skillsUrlOf = (workspace, sessionId) => SKILLS_ENDPOINT + paneQueryOf(workspace, sessionId)
+		/**
+		 * 「技能」块里那张清单的"是哪一版"标记（形态/观感换了就换这串字）。
+		 * 只放 data 属性、不挂 title，核对时在 DOM 里看 `data-skills-mark` 即可。
+		 */
+		const SKILLS_MARK = 'f30-技能栏：清单（层级标签 项目级·用户级·包内 + 提供者标签）+ 查看正文·复制正文·复制路径；卡片不印来源行与路径'
+
+			// ── 状态文件（看板那份）在界面上的固定约定 ──────────────────────────────────
+			// 状态落在同几个字段上 ⇒ 取数 / 筛选 / 分栏走同一套；差异只在取值顺序、中文名、次要筛选字段、卡片长相。
+

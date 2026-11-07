@@ -1,0 +1,438 @@
+		// ── ⑤ 样式表 ─────────────────────────────────────────────────────
+		const CSS = [
+			// 面板要填满可用区：定高由 `usePaneHeight` 量出来（行内 height），`100vh − 210px` 只是量不到时的兜底。
+			// 面板自身永不出滚动条（`overflow:hidden`）；内容超长时滚的是列内清单，不是整块面板。
+			'.cbv-root{--cbv-font-xs:11px;--cbv-font-sm:12px;--cbv-font-md:13px;--cbv-font-base:14px;--cbv-font-lg:15px;--cbv-leading-tight:1.35;--cbv-leading-normal:1.5;--cbv-weight-regular:400;--cbv-weight-strong:600;--cbv-font-mono:var(--dsh-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);--cbv-space-2xs:2px;--cbv-space-xs:4px;--cbv-space-sm:6px;--cbv-space-md:8px;--cbv-space-lg:10px;--cbv-space-xl:12px;--cbv-space-2xl:16px;--cbv-space-3xl:24px;--cbv-radius-sm:5px;--cbv-radius-md:6px;--cbv-radius-lg:8px;--cbv-radius-xl:10px;--cbv-radius-2xl:12px;--cbv-radius-pill:999px;--cbv-control-xs:24px;--cbv-control-sm:26px;--cbv-control-md:28px;--cbv-control-lg:32px;--cbv-touch-target:44px;--cbv-touch-target-lg:48px;--cbv-disabled-opacity:.5;--cbv-dur-fast:120ms;--cbv-dur-base:140ms;--cbv-dur-slow:200ms;--cbv-ease:ease-out;--cbv-z-overlay:60;--cbv-z-picker:80;--cbv-breakpoint-sm:480px;--cbv-breakpoint-xs:420px;--cbv-overlay-inset:8px;--cbv-modal-inset:16px;--cbv-board-col-min:220px;--cbv-grid-min:min(250px,100%);--cbv-picker-max-h:min(50vh,360px);--cbv-skeleton-delay:120ms;--cbv-skeleton-intrinsic:120px;--cbv-a1:color-mix(in srgb, var(--dsw-alias-label-primary) 6%, transparent);--cbv-a2:color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent);--cbv-a3:color-mix(in srgb, var(--dsw-alias-label-primary) 15%, transparent);--cbv-a4:color-mix(in srgb, var(--dsw-alias-label-primary) 21%, transparent);--cbv-a5:color-mix(in srgb, var(--dsw-alias-label-primary) 28%, transparent);--cbv-warn-ink:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 50%, var(--dsw-alias-label-primary));--cbv-ok-ink:color-mix(in srgb, var(--dsw-alias-state-success-primary) 50%, var(--dsw-alias-label-primary));--cbv-bad-ink:color-mix(in srgb, var(--dsw-alias-state-error-primary) 50%, var(--dsw-alias-label-primary));display:flex;flex-direction:column;gap:10px;width:100%;height:calc(100vh - 210px);min-height:160px;overflow:hidden;box-sizing:border-box;padding:4px 2px 0;color:var(--dsw-alias-label-primary);font-size:15px}',
+			// 内嵌那一份不自己撑视口高（否则上面还有控件行与搜索行，列底永远顶不到面板底）；
+			// 同权重后写者胜 ⇒ 必须排在 `.cbv-root` 之后。
+			'.cbv-root--embed{height:auto;flex:1 1 auto;min-height:0}',
+			// 告警那一句：**不加色相**，靠**加粗 + 词面**（"读不到"/"打回"）把意思说清。
+			'.cbv-note{color:var(--dsw-alias-label-primary);font-weight:600;font-size:13px}',
+			'.cbv-spacer{flex:1 1 auto}',
+			'.cbv-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+			// 键盘用户必须看得见焦点落在哪；DSH 自己的组件也是这套 focus-visible 写法。
+			'.cbv-btn:focus-visible,.cbv-note:focus-visible,.cbv-card:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}',
+			// 输入框的聚焦环**照本体的输入语言**（主题那个强调色）：面板里所有输入框一处判断，
+			// 与选择框里那个搜索框同一长相。这是本面板唯一一处破"不上色相"的地方 —— 理由是它属于
+			// **本体的输入语言**（现场那张图里那道青色环就是它），不是我加的装饰。
+			'.cbv-input:focus-visible,.cbv-select:focus-visible,.cbv-mp-textarea:focus-visible{outline:none;border-color:var(--dsw-alias-state-business-primary)}',
+
+			// 输入框 / 下拉与卡片同一套材质（中性透明度 + `border-l2`）：用不透明的 layer 色会在
+			// 浅色主题下与背景同值、深色主题下比卡片亮一档，出现"两套材质"。
+			'.cbv-input,.cbv-select{background:var(--cbv-a1);border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);border-radius:8px;height:26px;padding:0 8px;font-size:14px;font-family:inherit}',
+			'.cbv-input:hover,.cbv-select:hover{border-color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-input{min-width:0;flex:1 1 180px}',
+			// 看板分栏**随面板宽度自适应**（人的指令：分栏要做成响应式的）：
+			// `auto-fit + minmax(下限,1fr)` ⇒ 宽面板三栏等分、中等两栏、窄面板一栏，**不再靠横向滚动**
+			// （横向滚动把放不下的栏藏起来，窄栏里既看不见也滑不到）。`min(下限,100%)` 保证窄于下限时也不溢出。
+			// 行高 `minmax(0,1fr)`：每栏等高并填满看板；换行后每行均分高度，卡片多时在**栏内**各自滚。
+			'.cbv-board{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(var(--cbv-board-col-min),100%),1fr));grid-auto-rows:minmax(0,1fr);gap:10px;flex:1 1 auto;min-height:0;overflow-x:hidden;overflow-y:auto;padding:0 2px 6px;scrollbar-width:thin;scrollbar-gutter:stable}',
+			// 滚动条要看得见：macOS 覆盖式默认不显示 ⇒ 显式给细条（两轴都写，纵向兜底）。
+			'.cbv-board::-webkit-scrollbar{width:9px;height:9px}',
+			'.cbv-board::-webkit-scrollbar-track{background:var(--cbv-a1);border-radius:999px}',
+			'.cbv-board::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2);border-radius:999px}',
+			'.cbv-board::-webkit-scrollbar-thumb:hover{background:var(--dsw-alias-label-tertiary)}',
+			// 一栏：宽度由网格决定（不再写死）；`min-width:0` 让卡片自己断词换行，`overflow:hidden` 让栏内正文去滚。
+			'.cbv-col{display:flex;flex-direction:column;min-width:0;min-height:0;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden}',
+			'.cbv-col-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:none;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l2)}',
+			'.cbv-col-name{font-weight:600;font-size:14px}',
+			'.cbv-col-count{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:13px;font-variant-numeric:tabular-nums}',
+			'.cbv-dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}',
+			// 列内不再各自滚动：滚动条从每列一条收成整块一条，列高由内容决定。
+			// 列的正文区：**自己滚**（卡片多过列高时在列内滑，列高不撑破面板）。
+			// `flex:1 1 auto` + `min-height:0` 是让它能被压到比内容矮、从而触发滚动的两个必要条件。
+			// 两轴都写清楚：只写 `overflow-y:auto` 时按 CSS Overflow 3，x 轴（visible）会被算成 auto
+			// ⇒ 任何一行不换行的内容都会在栏里挤出一条横向滚动条。
+			'.cbv-col-body{display:flex;flex-direction:column;gap:6px;flex:1 1 auto;min-height:0;overflow:hidden auto;padding:8px}',
+			// 看板卡与其余几块共用几何（`.cbv-box`），底色用最淡的中性透明度，两种主题下都能从栏里浮出来。
+			'.cbv-card{cursor:pointer}',
+			// 静止态已经是 border-l2 ⇒ hover 不能只换描边（看不出来），改换底色。
+			'.cbv-card:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+			'.cbv-card-top{display:flex;align-items:center;gap:5px;flex-wrap:wrap}',
+			// 时间那一行：比正文小一档、颜色最轻（它是"什么时候动的"，不是要读的内容）。
+			'.cbv-sub--time{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-id{font-family:var(--dsh-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:13px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}',
+			'.cbv-chip{font-size:12px;line-height:16px;padding:0 5px;border-radius:4px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);white-space:nowrap}',
+			// 徽标三档都用中性底，靠深浅 + 描边样式区分（ok 最实、exception 虚线、bad 实线加粗）。
+			'.cbv-chip--phase{background:var(--cbv-a2)}',
+			// 优先级只给最高两档上色（P0 红 / P1 琥珀），P2/P3 保持中性 —— 满屏强调等于没有强调。
+			'.cbv-chip--p0{background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent);border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent);color:var(--cbv-bad-ink);font-weight:600}',
+			'.cbv-chip--p1{background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 16%, transparent);border-color:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 45%, transparent);color:var(--cbv-warn-ink)}',
+			'.cbv-chip--exception{background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);border-color:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 40%, transparent);border-style:dashed;color:var(--cbv-warn-ink)}',
+			// 只有"可以动手 / 具备条件"这一类才用 `--ok`（团队任务板的「可认领」）：给绿。
+			'.cbv-chip--ok{background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 16%, transparent);border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 42%, transparent);color:var(--cbv-ok-ink)}',
+			'.cbv-note--warn{font-weight:600}',
+			// 一句"要动作"的告警（"卡在：…"）：用错误色，但**只是字**（不填底）——
+			// 卡片里最该被一眼看到的句子就是它。
+			'.cbv-note--danger{color:var(--cbv-bad-ink);font-weight:600}',
+			'.cbv-desc{font-size:14px;line-height:1.45;word-break:break-word}',
+			// 折叠卡的任务描述只露两行；点卡片开的浮窗里印全文（不加这个类）。
+			'.cbv-clamp-2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}',
+			'.cbv-sub{font-size:13px;color:var(--dsw-alias-label-tertiary);word-break:break-all}',
+			'.cbv-detail{margin-top:2px;border-top:1px dashed var(--dsw-alias-border-l2);padding-top:5px;display:flex;flex-direction:column;gap:5px}',
+			// 明细块不再自带上限与滚动条：它长就让它长，滚动交给外层。
+			'.cbv-block{font-size:13px;line-height:1.5;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word;background:var(--cbv-a1);border:1px solid var(--dsw-alias-border-l2);border-radius:5px;padding:6px 7px}',
+			'.cbv-label{font-size:12px;color:var(--dsw-alias-label-tertiary);letter-spacing:.04em}',
+			'.cbv-msg{padding:12px 2px;color:var(--dsw-alias-label-tertiary);font-size:14px}',
+			'.cbv-empty{padding:10px 2px;color:var(--dsw-alias-label-tertiary);font-size:13px;text-align:center}',
+			'.cbv-overlay{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;align-items:flex-start;justify-content:center;padding:6vh 24px 24px;animation:cbv-fade .12s ease-out}',
+			'@keyframes cbv-fade{from{opacity:0}to{opacity:1}}',
+			'@keyframes cbv-pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}',
+			'@media (prefers-reduced-motion:reduce){.cbv-overlay,.cbv-modal{animation:none}.cbv-drop--on,.cbv-btn,.cbv-cardbtn,.cbv-tab,.cbv-flt-chip{transition:none}}',
+			// 浮窗与本体菜单同一层材质：底取 `--dsw-specific-menu`（取不到退回 bg-layer-1），
+			// 模糊取 `--dsw-menu-backdrop-filter`（取不到给保守 blur）—— 半透明而不糊字。
+			'.cbv-modal{background:var(--dsw-specific-menu,var(--dsw-alias-bg-layer-1));backdrop-filter:var(--dsw-menu-backdrop-filter,blur(20px) saturate(1.4));border:1px solid var(--dsw-alias-border-l2);border-radius:10px;box-shadow:0 18px 48px rgba(0,0,0,.38);width:min(860px,94vw);max-height:86vh;display:flex;flex-direction:column;overflow:hidden;animation:cbv-pop .14s ease-out;outline:none}',
+			'.cbv-modal-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l2);flex:none}',
+			// 浮窗里那句键盘提示：小字、次要色，靠右（`margin-left:auto`）、窄栏时允许换行，不跟按钮抢位置。
+			// 这一行**必须是一行**（现场：窄浮窗里被折成两行，"`Esc` 关"掉到下一行）。
+			// 于是 `nowrap` + 不再限宽到 52%；标题那一格自己有省略号，窄下来先瘦标题、不动这行提示。
+			'.cbv-modal-keys{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary);margin-left:auto;text-align:right;white-space:nowrap}',
+			'.cbv-modal-title{flex:1 1 auto;min-width:0;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+			// 顶部锚定（overlay 用 flex-start + 固定 padding-top）：垂直居中会让表头 y 随内容浮动，翻页按钮按不准。
+			'.cbv-modal-body{overscroll-behavior:contain}',
+			'.cbv-modal-actions{display:flex;align-items:center;gap:8px;flex:none}',
+			'.cbv-modal-body{overflow-y:auto;overflow-x:hidden;padding:12px;min-height:0}',
+			'.cbv-modal-body .cbv-card{cursor:default}',
+			// 文件三栏不是对话：用 `:has()` 在本栏在场时收起那对宽度拖拽条（卸载即恢复，纯 CSS）。
+			'[data-conversation-scroll]:has([data-team-ops-pane]) ~ [data-width-handle]{display:none}',
+			'.cbv-msg--error{color:var(--dsw-alias-label-primary);font-weight:600}',
+			// iOS 那种滑块：一个按钮 + 一个 knob；`aria-checked` 表达状态（键盘与读屏都认）。
+			// 成员卡的开关（`.cbv-switch*`）已随成员写面整面撤掉：那一栏现在只读，卡上只留状态词。
+			// 职责：**截断在 CSS**（-webkit-line-clamp）—— 不在 JS 里切字符串，于是"复制"拿到的仍是全文。
+			'.cbv-btn:disabled{opacity:.5;cursor:default}',
+			// 同一类毛病（浮窗里的第二条滚动条）：这块（成员提示词 / 技能正文）**在浮窗主体里**，
+			// 主体已经在滚（`.cbv-modal-body{overflow-y:auto}`）⇒ 这里不再自己限高、自己滚。
+			// 规矩只有一条：**滚动发生在包含头部的那一层**，里面任何块都不自己滚。
+			'.cbv-pre{margin:0;font-family:var(--dsh-font-mono,ui-monospace,Menlo,monospace);font-size:12.5px;white-space:pre-wrap;word-break:break-word}',
+			// ── 输入框工具行那一枚「角色」按钮 + 它的选择框（人的指令：按钮放在**输入框**里；
+			//     结构照本体那个「专家」选择框：搜索 + 按分类分组 + 头像行；材质全取主题的 token）──
+			// 按钮：与本体工具行那枚「+」同形同料（28px 药丸、`--dsw-specific-selector` 的底、圆角 999px）
+			'.cbv-rolepick{position:relative;display:inline-flex;align-items:center}',
+			// **无底色**（人的指令：「「角色」按钮不要背景色，鼠标移上去显示背景色」）：平时是透明的字，
+			// 悬停才浮出那一层交互底 —— 与「工作区内修改」那种"一直有底"的控件区分开。
+			'.cbv-composer-btn{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 8px;background:0 0;color:var(--dsw-alias-label-primary);border:none;border-radius:8px;cursor:pointer;font-size:13px;font-family:inherit;line-height:1;white-space:nowrap}',
+			'.cbv-composer-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,var(--cbv-a2))}',
+			// 按钮上的图标：与头像用同一套描边几何（`currentColor`，14px）。
+			'.cbv-composer-btn .cbv-mp-avatar-svg{width:14px;height:14px;flex:none}',
+			'.cbv-composer-btn:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:1px}',
+			'.cbv-composer-btn:disabled{opacity:.4;cursor:default}',
+			// 选择框：浮在输入框**上方**（fixed 定位 + 打开时按按钮位置算，免得被任何祖先的 overflow 裁掉），
+			// 底与模糊用本体菜单那一层材质（与浮窗同一套）。
+			// **这层必须 portal 到 `document.body`**（渲染处见 `RoleComposerEntry` 的 `portalOf(...)`）：
+			// 输入框那一片在已激活会话下带 `will-change: transform`（宿主的 `.composerSeat`），
+			// 会给 fixed 后代造包含块 ⇒ 不 portal 就会"跟着输入框走"，与按钮错位。
+			'.cbv-rolepick-pop{position:fixed;z-index:80;width:min(300px,70vw);max-height:min(46vh,360px);overflow-y:auto;background:var(--dsw-specific-menu,var(--dsw-alias-bg-layer-1));backdrop-filter:var(--dsw-menu-backdrop-filter,blur(20px) saturate(1.4));border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.32);padding:6px}',
+			// 选择框里那个搜索框**照本体的搜索框**：透明底、`.5px` 透明描边、聚焦时描边走主题自己的
+			// `--dsw-alias-state-business-primary`（现场那张图里那道青色环就是它 —— 这是**本体的输入语言**，
+			// 不是我们加的装饰；本面板只在这一处破例，别再往别处搬）。
+			'.cbv-rolepick-head{position:sticky;top:0;z-index:1;margin:-6px -6px 2px;padding:6px;background:var(--dsw-specific-menu,var(--dsw-alias-bg-layer-1));backdrop-filter:var(--dsw-menu-backdrop-filter,blur(20px) saturate(1.4));border-radius:12px 12px 0 0}',
+			// **吸顶**（人的指令）：列表再长，搜索框也钉在浮层顶部；负外边距把浮层的 6px 内边距也盖住，
+			// 免得行从上面那条缝里透出来。高度抬到 32px（原来靠 padding 撑着，偏矮），边框 **2px**。
+			'.cbv-rolepick-search{width:100%;height:32px;box-sizing:border-box;background:0 0;border:2px solid transparent;border-radius:var(--dsw-radius-xs);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;padding:0 8px;margin:0;outline:none;font-family:inherit}',
+			'.cbv-rolepick-search::placeholder{color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-rolepick-search:hover{border-color:var(--dsw-alias-border-l2)}',
+			'.cbv-rolepick-search:focus{border-color:var(--dsw-alias-state-business-primary)}',
+			// ── 输入框那一枚「角色」按钮的选择框里那些行（搜索 + 按分类分组 + 头像行；与本体那个
+			//     「专家」选择框同形）：这些 `cbv-picker-*` 只服务输入框那一席 ──
+			// 列表本身只做"选中"，不填色相：选中态用中性实底（与面板其余部分同一套材质）。
+			// 列表**摊平**（本体那个选择框就是不分内层盒子的）：不描边、不铺底，直接排在浮层上。
+			// **只留一条滚动条**（人的现场）：滚动容器是**外层浮层** `.cbv-rolepick-pop`，这一层
+			// **不**再自己滚 —— 那会变成"浮层一根 + 列表一根"两条，而且吸顶的搜索框会跟着内层滚走。
+			// 搜索框要吸顶，滚动就必须发生在**包含它的那一层**（sticky 相对最近的滚动祖先）。
+			'.cbv-picker{margin-top:2px}',
+			'.cbv-picker-group{margin-top:2px}',
+			// 组标题的参数照本体（`groupTitle`：11px / padding 6px 8px / 次要色）。
+			'.cbv-picker-head{font-size:11px;line-height:15px;color:var(--dsw-alias-label-tertiary);padding:4px 6px}',
+			'.cbv-picker-row{display:flex;align-items:center;gap:7px;padding:4px 6px;border-radius:6px;cursor:pointer}',
+			'.cbv-picker-row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+			'.cbv-picker-row--on{background:var(--cbv-a4)}',
+			'.cbv-picker-row:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}',
+			// 行里的头像：**圆形**、比成员卡小一号（照本体那个选择框；成员卡那边仍是圆角方 —— 两个场景两种形态）。
+			'.cbv-picker-row .cbv-mp-avatar{width:26px;height:26px;border-radius:50%}',
+			'.cbv-picker-row .cbv-mp-avatar-svg{width:15px;height:15px}',
+			'.cbv-picker-text{display:flex;flex-direction:column;gap:1px;min-width:0}',
+			'.cbv-picker-name{font-size:13px;color:var(--dsw-alias-label-primary)}',
+
+			// 一个动作 + 一句注解 + 结果回执的那一行（团队的"启用服务"按钮用它；模块化成一个可复用的行）。
+			'.cbv-acts{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:none}',
+			// 拖拽区：虚线框 + 居中三行 + 两个文字按钮；边框用主题的输入强调色（面板唯一允许的非标签色相）。
+			'.cbv-drop{border:1.5px dashed var(--dsw-alias-state-business-primary);border-radius:8px;background:var(--cbv-a1);padding:24px 16px;text-align:center;display:flex;flex-direction:column;justify-content:center;min-height:176px;box-sizing:border-box}',
+			'.cbv-drop--on{transition:border-color .12s ease-out}',
+			'.cbv-drop--on:hover{background:var(--cbv-a2)}',
+			'.cbv-drop-title{font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+			'.cbv-drop-note{margin-top:4px;font-size:13px;color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-drop-acts{margin-top:6px;font-size:13px}',
+			'.cbv-drop-link{background:0 0;border:0;padding:0 2px;font:inherit;color:var(--dsw-alias-label-primary);text-decoration:underline;cursor:pointer}',
+			'.cbv-drop-link:hover{color:var(--dsw-alias-label-primary)}',
+			'.cbv-drop-sep{color:var(--dsw-alias-label-tertiary)}',
+			// 区里那三条"文件要求"：左对齐的小字（贴着拖拽区下缘，读的人先看区里的内容再看它）。
+			'.cbv-drop-req{margin:12px auto 0;max-width:340px;text-align:left;font-size:12px;line-height:1.7;color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-notice{margin-top:8px;border-radius:8px;padding:6px 8px;font-size:13px;border:1px solid var(--dsw-alias-border-l2);background:var(--cbv-a1);color:var(--dsw-alias-label-secondary);white-space:pre-wrap}',
+			'.cbv-notice--ok{border-color:var(--dsw-alias-border-l2);background:var(--cbv-a1)}',
+			'.cbv-notice--error{border-color:var(--dsw-alias-border-l2);background:var(--cbv-a2);font-weight:600}',
+			// 按钮只有这一条基样式（原来两条同名规则，靠数组顺序定胜负）：外观 + 尺寸 + 光标都在这。
+			'.cbv-btn{appearance:none;flex:none;font-family:inherit;font-size:13px;line-height:22px;padding:0 10px;border-radius:5px;cursor:pointer;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-secondary)}',
+			// 按钮三档：都不给色相 —— primary 实一点、bad 描边加粗（"这是要动手的那个"靠层次说）。
+			'.cbv-btn--primary{border-color:transparent;background:var(--cbv-a4);color:var(--dsw-alias-label-primary);font-weight:600}',
+			'.cbv-btn--bad{border-color:var(--dsw-alias-border-l2);background:var(--cbv-a1);font-weight:600}',
+			'.cbv-btn[disabled]{opacity:.5;cursor:default}',
+			// 「贴了底的框」那一版**改名**（原来也叫 `.cbv-note`，把上面那条文字样式整个盖掉了）：
+			'.cbv-note--box{min-width:120px;padding:3px 6px;border-radius:5px;border:1px solid var(--dsw-alias-border-l2);background:var(--cbv-a1)}',
+			// 文件文本的 Markdown 渲染：容器关掉 pre-wrap（换行由块结构表达），块与行内元素各给最小样式。
+			'.cbv-md{white-space:normal}',
+			'.cbv-md>:first-child{margin-top:0}',
+			'.cbv-md>:last-child{margin-bottom:0}',
+			'.cbv-md-p{margin:0 0 5px}',
+			'.cbv-md-h{margin:6px 0 4px;line-height:1.35;font-size:14px}',
+			'.cbv-md-list{margin:0 0 5px;padding-left:18px}',
+			'.cbv-md-list li{margin:1px 0}',
+			'.cbv-md-quote{margin:0 0 5px;padding:1px 0 1px 8px;border-left:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}',
+			// 代码块换行而不是横向滚（长行一滚就是一条横向滑动栏）。
+			'.cbv-md-table-wrap{margin:0 0 5px;overflow-x:auto}',
+			'.cbv-md-table{border-collapse:collapse;font-size:13px;line-height:1.4}',
+			'.cbv-md-table th,.cbv-md-table td{border:1px solid var(--dsw-alias-border-l2);padding:3px 7px;text-align:left;vertical-align:top}',
+			'.cbv-md-table th{background:var(--cbv-a1);font-weight:600}',
+			'.cbv-md-cell--right{text-align:right}',
+			'.cbv-md-cell--center{text-align:center}',
+			'.cbv-md-pre{margin:0 0 5px;padding:5px 7px;background:var(--cbv-a1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;white-space:pre-wrap;word-break:break-word}',
+			'.cbv-md-pre code{background:transparent;border:0;padding:0}',
+			'.cbv-md-hr{border:0;border-top:1px solid var(--dsw-alias-border-l2);margin:6px 0}',
+			'.cbv-md a{color:var(--dsw-alias-label-primary);text-decoration:underline;word-break:break-all}',
+			'.cbv-md code{font-family:var(--dsh-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:13px;background:var(--cbv-a2);border:1px solid var(--dsw-alias-border-l2);border-radius:3px;padding:0 3px}',
+			// 这几个位置只做**行内**渲染（`inlineNodes`），外层不挂 `.cbv-md`（挂了会改掉它们的 white-space），
+			// 所以行内代码/粗体的样式在这里单独给一份 —— 与 `.cbv-md code` 同一套观感。
+			'.cbv-modal-keys code,.cbv-mp-field-label code,.cbv-flt-bar code{font-family:var(--dsh-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;background:var(--cbv-a2);border:1px solid var(--dsw-alias-border-l2);border-radius:3px;padding:0 3px}',
+			'.cbv-act-err{font-size:13px;color:var(--dsw-alias-label-primary);font-weight:600;flex-basis:100%}',
+			// ── 「成员」块（卡片网格）────────────────────────────────────────────────
+			// 面板是**窄栏**（宽度由壳的拖拽条决定、与视口无关）⇒ 列数交给 `auto-fill` 自己算，
+			// 不写 `@media`、也不量宽：窄了自动落一列，卡片自己断词换行，永不出横向滚动条。
+
+			// 住在视图栏里那一块：撑满剩余高度、清单自己滚（面板定高由量高那一套给，不在这里再猜一个高度）。
+			// 一个块里有"顶部一行 + 一份可伸缩的视图"时用这一层（任务看板那两个来源就是这种）：
+			// 它自己撑满并让里面的视图去滚（`.cbv-root--embed` / `.cbv-board` 都带 `flex:1 1 auto;min-height:0`）。
+			// ── 四块共用的一套「块骨架」──────────────────────────────────────────────
+			//   `.cbv-view` = 块根（竖排、撑满、可伸缩）；`.cbv-view-head` = 块头那一行（内页标题已撤）；
+			//   `.cbv-scroll` = 唯一滚动区；`.cbv-box` = 卡片共用几何（底色各块自己给）。
+			'.cbv-view{display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-height:0;color:var(--dsw-alias-label-primary);font-size:14px}',
+			'.cbv-view-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;flex:none}',
+			// 四块共用卡片几何：描边用 `border-l2`（`border-l1` 在浅色主题下只有 1.09:1，卡片等于没画）；
+			// 底色也在这条里（`--cbv-a1`），避免"看板卡改过来了、另外两块没改"。
+			'.cbv-box{display:flex;flex-direction:column;gap:6px;min-width:0;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;padding:10px 12px;background:var(--cbv-a1)}',
+			// 唯一滚动区：卡区 / 列表在它里面滚（滚动区一多，后半截会被挤出可视区）。
+			'.cbv-scroll{flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding-right:2px}',
+			// 状态标签：底只分档，词面照引擎取值；强调色只用主题三个状态 token 的 16%~18% 淡染。
+			'.cbv-chip--st-todo{border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}',
+			// 五档状态标签不用色相：底深浅 + 描边样式 + 字重 + 删除线区分；
+			// 待办=描边、进行中=淡底、待验收=淡底+虚线、已完成=实底+加粗、已打回=描边+加粗+划线。
+			'.cbv-chip--st-doing{background:var(--cbv-a4);color:var(--dsw-alias-label-primary);font-weight:600}',
+			// 待验收：**琥珀**（"要人看一眼"）
+			'.cbv-chip--st-verify{background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 18%, transparent);border-color:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 45%, transparent);color:var(--cbv-warn-ink)}',
+			// 已完成：**绿**
+			'.cbv-chip--st-done{background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 18%, transparent);border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 45%, transparent);color:var(--cbv-ok-ink);font-weight:600}',
+			// 已打回：**红** + 划掉
+			'.cbv-chip--st-rejected{background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent);border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent);color:var(--cbv-bad-ink);font-weight:600;text-decoration:line-through}',
+			// 栏头下面那一句（出口准则 / 清单登记状态）：小字、不占满、最多两行。
+			'.cbv-col-note{font-size:12px;line-height:1.45;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}',
+			// 「角色」块里那一段（来源筛选 + 角色卡 + 角色包入口；整块自己滚）。
+			'.cbv-roster{display:flex;flex-direction:column;gap:8px;flex:0 0 auto}',
+
+			'.cbv-roster-card{padding-bottom:0}',
+			// 清单里的名字那一列：与成员卡同款（`.cbv-mp-nameblock`），只是里面装的是 id + 两枚 chip。
+			'.cbv-roster-card .cbv-id{font-size:13px}',
+			// 网格是**栏内滚动的那一层**：`min-height:0` 才压得住内容高，压得住才会滚。
+			// （滚动区那一条见上面的 `.cbv-scroll`：四块共用 —— 卡区自己带 `overflow` 会把后面那节
+			// 挤出可视区，那是现场打回过的一条，所以现在只有"块里一个滚动区"这一种写法。）
+			'.cbv-scroll .cbv-mp-grid{flex:0 0 auto}',
+
+			// 引擎那一轮自己的告警（看板读不到、编号查不到…）：原文透出，**只读**，不换措辞。
+			'.cbv-pane-warn{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-primary);font-weight:600;overflow-wrap:anywhere;min-width:100%}',
+			// **状态行一律占满整行**（`min-width:100%`）：它们与块标题是同级的读数列 —— 父级是列时本来就各占一行（当前如此）；
+			// 父级若变成 flex 行，这一条保证它们**不会并到标题那一行**。
+			// **不用 `flex-basis:100%`**：在列方向那等于"占满高度"，会把整块撑出一大片空白（现场已踩）。
+			'.cbv-pane-note{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere;min-width:100%}',
+			// **定高一行**：原来高度由内容撑（`padding:8px 0` + 换行），而两档的内容不一样
+			// （团队那一档只有 chip，里程碑那一档多一个下拉 + 一个搜索框）⇒ 切换时整行高度变几个像素，
+			// chip 看起来"上下浮动"（现场原话）。现在行高固定、子项居中，栏里放不下就这一行自己横向滚。
+			// `flex:none` 是必须的：它在 `.cbv-view` 那条 flex 列里，`height` 不是硬下限 —— 面板一矮就会被
+			// 下面 `flex:1 1 auto` 的看板挤成 1–2px（现场：团队那一档只看得到 chip 底部一两个像素）。
+			'.cbv-flt-bar{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;flex:none;height:34px;padding:0;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;border-top:1px solid var(--dsw-alias-border-l2);border-bottom:1px solid var(--dsw-alias-border-l2)}',
+			// 分档 chip：`aria-pressed` 表达选中（键盘与读屏都认），选中态同时改边色。
+			'.cbv-flt-chip{appearance:none;flex:0 0 auto;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-secondary);border-radius:999px;height:24px;padding:0 10px;font-size:12px;line-height:22px;font-family:inherit;cursor:pointer;white-space:nowrap}',
+			'.cbv-flt-chip:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+			'.cbv-flt-chip--on{border-color:transparent;background:var(--cbv-a3);color:var(--dsw-alias-label-primary);font-weight:600}',
+			'.cbv-flt-chip:disabled{opacity:.5;cursor:default}',
+			'.cbv-flt-search{min-width:60px;flex:1 1 180px}',
+			'.cbv-flt-select{flex:0 0 auto;max-width:190px}',
+			// 两列的算术：设置面板固定 800px − 左侧导航 188px − 内容区左右各 24px = 564px，
+			// 于是 `minmax(250px,1fr)` 恰好落两列（2×250 + 10 的缝 = 510 ≤ 564）；再宽才可能三列。
+			// 卡区：成员 / 技能 / 角色 / 另一处清单共用同一套网格（同一断点、同一间距）。
+			// 下限写 `min(250px,100%)`：面板宽度是拖拽条给的、与视口无关，`@media` 兜不住窄栏 ——
+			// 轨道有 250px 硬下限时，栏一拖窄就横向溢出。
+			'.cbv-mp-grid,.cbv-sk-grid,.cbv-roster-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(250px,100%),1fr));gap:10px;align-content:start}',
+			// **卡内不许裁任何一行**（现场：底排那三个按钮被卡边裁掉半截）：所以卡片**不设** `overflow:hidden`，
+			// 靠"卡是 flex 列 + 动作条 `margin-top:auto`"把动作条钉在卡底，圆角由动作条自己那一条兜住。
+			// 成员卡：底色 `layer-1`（贴在面板底上）+ 底下留 0（动作条自己贴到卡底）；几何在 `.cbv-box` 里。
+			'.cbv-mp-card{padding-bottom:0}',
+			// 停用卡**不压整卡透明度**（那会把名字/职责/按钮一起压到 2.53:1）：底淡一格、动作条压一点。
+			'.cbv-mp-card--off{background:var(--cbv-a1)}',
+			'.cbv-mp-card--off .cbv-cardbar{opacity:.7}',
+			'.cbv-mp-top{display:flex;align-items:flex-start;gap:9px}',
+			'.cbv-mp-avatar{flex:0 0 auto;width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:24px;line-height:1;background:var(--cbv-a2);border:1px solid var(--dsw-alias-border-l2)}',
+			// 头像底色按**色调档**（引擎给的 `avatarTone`，六档；自定义角色也落在其中一档）：
+			// 一层中性透明度的色块，图标本身**只描边、不上色**（`currentColor`，颜色由主题给）。
+			// 图标是 18px 的描边 SVG（`.cbv-mp-avatar-svg`），字面量兜底（`.cbv-mp-avatar-text`）才用字号。
+			'.cbv-mp-avatar-svg{display:block;overflow:visible}',
+			'.cbv-mp-avatar-text{font-size:20px;line-height:1}',
+			'.cbv-mp-avatar--eng{background:var(--cbv-a3)}',
+			'.cbv-mp-avatar--design{background:var(--cbv-a2)}',
+			'.cbv-mp-avatar--data{background:var(--cbv-a4)}',
+			'.cbv-mp-avatar--biz{background:var(--cbv-a1)}',
+			'.cbv-mp-avatar--ops{background:var(--cbv-a5)}',
+			'.cbv-mp-avatar--exec{background:var(--cbv-a3)}',
+			'.cbv-mp-nameblock{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:2px}',
+			'.cbv-mp-name{font-size:15px;font-weight:600;overflow-wrap:anywhere}',
+			'.cbv-mp-sub{font-size:12px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
+			'.cbv-mp-state{font-size:12px;color:var(--dsw-alias-label-tertiary);align-self:flex-start;margin-top:2px;flex:0 0 auto}',
+			'.cbv-badges{display:flex;flex-wrap:wrap;gap:4px 6px;align-items:center}',
+			// 筛选行里的那一簇 chip（来源分档就是它）：**不许被压缩**（窄面板时被挤成 0 宽 = "看不到"），也不许内部折行。
+			'.cbv-flt-bar > .cbv-badges{flex:0 0 auto;flex-wrap:nowrap}',
+			'.cbv-badge{font-size:11px;line-height:17px;padding:0 6px;border-radius:4px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);white-space:nowrap}',
+			'.cbv-badge--present{background:var(--cbv-a2)}',
+			'.cbv-badge--archived{border-color:var(--dsw-alias-label-tertiary);color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-badge--retired{border-color:var(--dsw-alias-label-secondary);color:var(--dsw-alias-label-secondary)}',
+			'.cbv-badge--warn{background:var(--cbv-a1);font-weight:600}',
+			// 职责：**截断在 CSS**（`-webkit-line-clamp`）—— 不在 JS 里切字符串，于是"复制"拿到的仍是全文。
+			'.cbv-mp-duty{font-size:13px;line-height:1.5;color:var(--dsw-alias-label-secondary);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}',
+			'.cbv-mp-row{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
+			'.cbv-mp-key{color:var(--dsw-alias-label-secondary)}',
+			// 底排动作：与角色卡同一套"平分一条通栏"的形态（卡内不再放浮起的主按钮）。
+			// `margin-top:auto`：同一行里各卡内容长短不齐时，动作条一律落在**卡底**（不会被内容顶出卡外）。
+			// 底部圆角与 `overflow:hidden` 从卡片挪到这一条上 —— 卡片已经不裁了，扣角的活由它自己干。
+			'.cbv-cardbar{display:flex;margin:auto -12px 0;border-top:1px solid var(--dsw-alias-border-l2);border-radius:0 0 10px 10px;overflow:hidden}',
+			'.cbv-cardbtn{flex:1 1 0;appearance:none;border:0;border-right:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-secondary);font-size:13px;font-family:inherit;padding:7px 4px;cursor:pointer;white-space:nowrap}',
+			'.cbv-cardbtn:last-child{border-right:0}',
+			'.cbv-cardbtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+			'.cbv-cardbtn:disabled{opacity:.5;cursor:default}',
+			'.cbv-cardbtn:focus-visible,.cbv-flt-chip:focus-visible,.cbv-mp-textarea:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}',
+			'.cbv-pane-empty{padding:14px 2px;color:var(--dsw-alias-label-tertiary);font-size:13px;text-align:center;border:1px dashed var(--dsw-alias-border-l2);border-radius:8px}',
+			'.cbv-pane-meta{font-size:12px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere;min-width:100%}',
+			// 对话框里的字段（复用 `.cbv-overlay` / `.cbv-modal` 外壳，只补表单那几行）。
+			'.cbv-modal--members{max-width:min(760px,94vw)}',
+			'.cbv-mp-field{display:flex;flex-direction:column;gap:3px;margin-top:8px}',
+			// 浮窗里的输入框：`.cbv-input` 那条 `flex:1 1 180px` 是给**行内**排布写的 —— 在这里的
+			// 列排布里它会变成"高度 180px 起"，所以就地收回成不伸缩、占满一行。
+			'.cbv-mp-field .cbv-input,.cbv-mp-field .cbv-mp-textarea{flex:0 0 auto;width:100%;box-sizing:border-box}',
+			'.cbv-mp-field-label{font-size:12px;color:var(--dsw-alias-label-tertiary);letter-spacing:.02em}',
+			// 字段下面那一行说明（`.cbv-mp-field-note`）：**一类**，弹窗里所有说明都走它。
+			'.cbv-mp-field-note{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
+			'.cbv-mp-field-note+.cbv-mp-field{margin-top:10px}',
+			'.cbv-mp-field-empty{font-size:13px;line-height:1.5;color:var(--dsw-alias-label-tertiary);border:1px dashed var(--dsw-alias-border-l2);border-radius:5px;padding:6px 7px;overflow-wrap:anywhere}',
+			// 多行文本框只此一条（角色 / 成员弹窗共用）：圆角描边底与 `.cbv-input` 一致，高度由 `rows` 决定；
+			// 千万不要挂 `.cbv-input`（`height:26px` 会把 rows=5 的正文压成一行）。
+			'.cbv-mp-textarea{width:100%;box-sizing:border-box;background:var(--cbv-a1);border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);border-radius:8px;padding:6px 8px;font-size:13px;line-height:1.5;font-family:inherit;resize:vertical;min-height:40px}',
+			// 成员编辑弹窗撤下之后，`.cbv-mp-check`（那一对复选框）没有使用者了 ⇒ 规则一并删掉。
+			// 极窄视口兜底：列数本来由 `auto-fill` 自己算（面板宽度由壳给），这一条只是不让卡片挤成窄条。
+			'@media (max-width:420px){.cbv-mp-grid,.cbv-sk-grid{grid-template-columns:1fr}}',
+
+			// ── 「技能」块（清单卡片；与成员块共用过滤条 / 徽标 / 底排按钮那几套）────────────────
+			// 这一块是**只读**的：看清单 → 看正文 → 复制。增删启停不在这一栏（那件事有它自己的
+			// 管理面，本插件不造第二份真相：`ctx.skills` 是只读目录，写技能文件是别人家的地盘）。
+
+
+			// 同成员卡：**不裁内容**（卡边永远不能切掉一整行），动作条钉在卡底。
+			'.cbv-sk-card{padding-bottom:0}',
+			'.cbv-sk-name{font-size:15px;font-weight:600;overflow-wrap:anywhere}',
+			// 描述与"什么时候用它"是**两句不同的话**，各占一行、不糊成一段。
+			'.cbv-sk-desc{font-size:13px;line-height:1.5;color:var(--dsw-alias-label-secondary);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}',
+			'.cbv-sk-when{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
+			'.cbv-modal--skills{max-width:min(860px,94vw)}',
+			// **窄弹窗**（宽度只有这一处正文，几个短弹窗共用这一个类）：写入口（导入 / 新建技能）与
+			// 角色弹窗（添加 / 修改 / 删除）都走它 ⇒ 宽度一致；内容多的两支（查看提示词 / 编辑提示词）
+			// 不加这个类，仍走上面的 860px —— 它们要装长文本。
+			'.cbv-modal--narrow{width:min(520px,92vw);max-width:min(520px,92vw)}',
+
+			// ── 交互改造（task-4）：块壳 / tab / 回执 / 确认 / 骨架 / 小屏与触摸 ─────────────
+			// 一条视觉隐藏：读屏能读到、视觉不占位（加载播报、禁用理由都靠它）。
+			'.cbv-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}',
+			// 保活渲染：非当前块用 `hidden` 隐藏（`display:none` 同时让它不可聚焦）。
+			'.cbv-block-panel{display:flex;flex-direction:column;flex:1 1 auto;min-height:0}',
+			'.cbv-block-panel[hidden]{display:none!important}',
+			// 块切换的 tablist：窄栏横向滚、不换行。
+			'.cbv-tabs{display:inline-flex;align-items:center;gap:4px;flex-wrap:nowrap;min-width:0;max-width:100%;overflow-x:auto;scrollbar-width:thin}',
+			'.cbv-tab{flex:0 0 auto}',
+			'.cbv-tab[aria-selected="true"]{font-weight:600}',
+			// 块顶回执：成功 / 失败同形不同角色（`role` 与 `data-notice-tone` 见 NoticeBar）。
+			'.cbv-notice--slot{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;flex:none;margin-top:0}',
+			'.cbv-notice-body{flex:1 1 220px;min-width:0;display:flex;flex-direction:column;gap:2px}',
+			'.cbv-notice-btn{align-self:flex-start}',
+			// 确认浮窗：标题 + 正文 + 底部动作区（默认焦点在「取消」）。
+			'.cbv-modal--confirm{width:min(520px,92vw);max-width:min(520px,92vw)}',
+			'.cbv-confirm-title{font-size:15px;font-weight:600;line-height:1.35}',
+			'.cbv-confirm-line{margin-top:8px;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-secondary)}',
+			'.cbv-confirm-actions{padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l2);justify-content:flex-end;flex-wrap:wrap}',
+			// 骨架：静态灰块（**不做 shimmer**，与 reduced-motion 无冲突），几何尽量贴真实卡。
+			'.cbv-skel-block{display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-height:0}',
+			'.cbv-skel{pointer-events:none}',
+			'.cbv-skel-top{display:flex;align-items:flex-start;gap:9px}',
+			'.cbv-skel-avatar{display:block;flex:0 0 auto;width:44px;height:44px;border-radius:10px;background:var(--cbv-a2)}',
+			'.cbv-skel-lines{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:6px}',
+			'.cbv-skel-line{display:block;height:10px;border-radius:var(--cbv-radius-sm);background:var(--cbv-a2)}',
+			'.cbv-skel-line--title{width:45%;height:14px}',
+			'.cbv-skel-line--body{width:85%}',
+			'.cbv-skel-line--bar{margin-top:6px;width:100%;height:20px;border-radius:var(--cbv-radius-sm)}',
+			'.cbv-skel-chip{display:inline-block;flex:0 0 auto;width:64px;height:20px;border-radius:var(--cbv-radius-pill);background:var(--cbv-a2)}',
+			'.cbv-skel-chip--wide{width:110px}',
+			'.cbv-skel-search{flex:1 1 180px;max-width:240px;height:22px;border-radius:var(--cbv-radius-sm);background:var(--cbv-a2)}',
+			'.cbv-picker-skel{display:flex;flex-direction:column;gap:4px;padding:4px 6px}',
+			'.cbv-picker-skel-row{display:flex;align-items:center;gap:7px}',
+			'.cbv-picker-skel-row .cbv-skel-avatar{width:26px;height:26px;border-radius:50%}',
+			'.cbv-picker-skel-row .cbv-skel-line{flex:1 1 auto}',
+			'.cbv-picker-insert-error{margin-top:6px;padding:8px;display:flex;flex-direction:column;gap:6px;text-align:left}',
+			// 条件不允许（`aria-disabled`）与临时 busy（原生 disabled）在视觉上一致，语义不同。
+			'.cbv-cardbtn[aria-disabled="true"]{opacity:var(--cbv-disabled-opacity);cursor:default}',
+			'.cbv-btn[aria-disabled="true"]{opacity:var(--cbv-disabled-opacity);cursor:default}',
+			// 小屏（视口 ≤ 480px，**不假设面板宽度**）：工具栏换行、浮窗内缩、tab 单行横滚、看板栏宽用令牌。
+			'@media (max-width:480px){.cbv-overlay{align-items:stretch;padding:var(--cbv-overlay-inset)}.cbv-modal,.cbv-modal--members,.cbv-modal--skills,.cbv-modal--narrow,.cbv-modal--confirm{width:calc(100vw - var(--cbv-modal-inset));max-width:calc(100vw - var(--cbv-modal-inset));max-height:calc(100dvh - var(--cbv-modal-inset))}.cbv-flt-bar{flex-wrap:wrap;height:auto;min-height:34px;row-gap:6px;padding:4px 0}.cbv-flt-bar>.cbv-badges{flex-wrap:wrap}.cbv-flt-search{flex:1 1 100%}.cbv-tabs{width:100%}.cbv-mp-grid,.cbv-sk-grid,.cbv-roster-grid{grid-template-columns:1fr}.cbv-rolepick-pop{width:min(300px,calc(100vw - var(--cbv-modal-inset)));max-height:var(--cbv-picker-max-h)}}',
+			// 触摸（`pointer: coarse`）：主要按钮 / 卡片动作 / 选择行 44px，输入框 40px，chip 32px。
+			'@media (pointer:coarse){.cbv-btn,.cbv-cardbtn,.cbv-picker-row,.cbv-tab{min-height:var(--cbv-touch-target)}.cbv-input,.cbv-select{min-height:40px;height:auto}.cbv-flt-chip{min-height:32px}}',
+			// ── 输入框「润色」（design-polish-001）：入口按钮 + 对比浮窗 ─────────────────────
+			// 浮窗是 portal 到 `document.body` 的（composer 那片 `will-change: transform` 会给
+			// `position:fixed` 造包含块）⇒ **不在 `.cbv-root` 作用域里**，所以这里不引用 `--cbv-a*`
+			// 那组中性格；底色只用 `--dsw-*` 的中性语义变量，**色相一律复用既有标签类**（见组件里的
+			// `cbv-chip--st-rejected` / `--st-done` / `--st-verify` / `--p0`）—— 与"强调只给标签"那条口径一致。
+			'.cbv-polish{position:relative;display:inline-flex;align-items:center}',
+			'.cbv-polish-btn{padding:0 6px}',
+			'.cbv-polish-icon{display:block;width:16px;height:16px;flex:none}',
+			'.cbv-polish-btn[aria-disabled="true"]{opacity:var(--cbv-disabled-opacity,.5);cursor:default}',
+			'.cbv-polish-btn--busy .cbv-polish-icon{animation:cbv-polish-spin .9s linear infinite}',
+			'@keyframes cbv-polish-spin{to{transform:rotate(360deg)}}',
+			// 就地提示：贴在按钮上方的一个小气泡（不打开浮窗，`aria-describedby` 指过来）。
+			'.cbv-polish-overlay{align-items:center;padding:24px}',
+			'.cbv-polish-modal{width:min(760px,94vw)}',
+			'.cbv-polish-sub{flex:0 1 auto;min-width:0;font-size:12px;color:var(--dsw-alias-label-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+			'.cbv-polish-body{display:flex;flex-direction:column;gap:10px}',
+			'.cbv-polish-section{display:flex;flex-direction:column;gap:4px;min-width:0}',
+			'.cbv-polish-label{display:flex;align-items:baseline;gap:8px;font-size:12px;color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-polish-count{margin-left:auto;font-variant-numeric:tabular-nums}',
+			// 两段只读区：**都可滚、都可复制**；浮窗内再滚一层，避免长文把按钮顶出视口。
+			'.cbv-polish-text{font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;max-height:30vh;overflow-y:auto;overscroll-behavior:contain;background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px}',
+			'.cbv-polish-text:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}',
+			'.cbv-polish-mark{border-radius:3px;padding:0 1px}',
+			'.cbv-polish-mark--del{text-decoration:line-through}',
+			'.cbv-polish-mark--add{text-decoration:none}',
+			'.cbv-polish-loading{display:flex;flex-direction:column;gap:6px;padding:10px;background:transparent;border:1px dashed var(--dsw-alias-border-l2);border-radius:8px}',
+			'.cbv-polish-skel{display:block;height:10px;border-radius:5px;background:var(--dsw-alias-border-l2)}',
+			'.cbv-polish-loading-word{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
+			'.cbv-polish-error{padding:8px 10px;border-width:1px;border-style:solid;border-radius:8px;font-size:13px;line-height:1.5}',
+			'.cbv-polish-reason{margin-top:4px;font-weight:400;color:var(--dsw-alias-label-secondary)}',
+			'.cbv-polish-warn{padding:8px 10px;border-width:1px;border-style:solid;border-radius:8px;font-size:12px;line-height:1.5}',
+			'.cbv-polish-warn-title{font-weight:600}',
+			'.cbv-polish-warn-line{margin-top:2px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}',
+			'.cbv-polish-summary{font-size:12px;color:var(--dsw-alias-label-secondary)}',
+			'.cbv-polish-copied{font-size:12px;color:var(--dsw-alias-label-secondary)}',
+			'.cbv-polish-foot{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l2);flex:none}',
+			// 小屏：浮窗内缩到视口内（`--cbv-modal-inset` 不在 `.cbv-root` 里，给 16px 兜底）。
+			'@media (max-width:480px){.cbv-polish-modal{width:calc(100vw - var(--cbv-modal-inset, 16px));max-width:calc(100vw - var(--cbv-modal-inset, 16px))}.cbv-polish-text{max-height:26vh}}',
+			'@media (prefers-reduced-motion:reduce){.cbv-polish-btn--busy .cbv-polish-icon{animation:none}}',
+		].join('\n')
+

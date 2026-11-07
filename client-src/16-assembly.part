@@ -1,0 +1,145 @@
+		// ── ⑯ 装配与导出 ───────────────────────────────────────────────────
+		const insertStyles = () => {
+			if (typeof document === 'undefined' || document === null) return () => {}
+			const style = document.createElement('style')
+			style.setAttribute('data-dsh-team-ops', 'ledger-views')
+			style.textContent = CSS
+			;(document.head || document.body).appendChild(style)
+			return () => {
+				try {
+					if (style.parentNode !== null) style.parentNode.removeChild(style)
+				} catch {}
+			}
+		}
+
+		/**
+		 * 客户端插件体：注册**一个席位** —— 对话窗视图栏里那一栏（「团队状态」）。
+		 *
+		 * 一栏四块（块序见 `BLOCKS`）：**成员 / 角色 / 技能 / 任务看板**。
+		 * 打开面板就是"现在到哪了"那一屏（三行状态 + 块切换 + 工作区），
+		 * 四块共用同一份取数纪律：每条读数都来自引擎或宿主的**同一处判定**，本文件不另算一套。
+		 * @param ctx - 客户端 cordis 上下文。
+		 */
+		function apply(ctx) {
+			// **第一件事**：把 ctx 装进那一格 —— 视图组件与取值帮手都在本函数之外，靠它拿服务
+			// （`sessions` / `uiSession`）。晚于第一次渲染装进去，第一帧就会读到"取不到会话"。
+			clientCtx = ctx
+			try {
+				if (typeof ctx.effect === 'function') ctx.effect(insertStyles, 'dsh-team-ops: ledger view styles')
+			} catch (error) {
+				try {
+					console.warn('[dsh-team-ops] 样式插入失败，视图仍可渲染：', error && error.message)
+				} catch {}
+			}
+
+			if (ctx.slots === undefined || typeof ctx.slots.inject !== 'function') {
+				try {
+					console.warn('[dsh-team-ops] 客户端无 slots 服务，视图未注册')
+				} catch {}
+				return
+			}
+
+			// 会话清单 store：`sessions` 在 inject 里点名 ⇒ cordis 等它就绪才跑 apply（一次性 ctx.get 不等待）；
+			// 这里仍按调用现取，视图每次渲染再取一次作兜底。
+			const sessionsOf = () => sessionsListStore()
+
+			// **一栏**（不是多栏）：打开就是"现在到哪了"那一屏 —— 三行状态 + 四个块。
+			// 四块各自成组件（成员 / 角色 / 技能 / 任务看板），在这一栏里按块切换（见本文件 StatusView）。
+			ctx.slots.inject('conversation.view', () => {
+				const dispose = ctx.slots.register(
+					{ name: 'conversation.view', id: 'company-status', order: 20, label: '团队状态' },
+					() => el(StatusView, { sessions: sessionsOf, slots: ctx.slots }),
+				)
+				return () => {
+					if (typeof dispose === 'function') dispose()
+				}
+			})
+
+			// ①′ 角色进本体的 `@` 菜单 + 热词典（与专家进菜单同一条路：`inputTriggers.registerSource`）；
+			// 在席位之外单独挂，随插件一起注销。
+			let disposeRoleSource = registerRoleTriggerSource(ctx, ctx.sessions)
+			let roleSourceRetry = null
+			// `inputTriggers` 不在 inject 里（老宿主可能没有这个服务）⇒ `ctx.get` 可能早一步取不到。
+			// 取不到就**短轮询等它出现**（最多约 10 秒），不能就此永远没有 `@` 菜单。
+			if (disposeRoleSource === null) {
+				let tries = 0
+				roleSourceRetry = setInterval(() => {
+					tries += 1
+					const dispose = registerRoleTriggerSource(ctx, ctx.sessions)
+					if (dispose !== null) {
+						disposeRoleSource = dispose
+						clearInterval(roleSourceRetry)
+						roleSourceRetry = null
+					} else if (tries >= 40) {
+						clearInterval(roleSourceRetry)
+						roleSourceRetry = null
+					}
+				}, 250)
+				try {
+					if (typeof roleSourceRetry?.unref === 'function') roleSourceRetry.unref()
+				} catch {
+					/* 浏览器计时器没有 unref */
+				}
+			}
+			if (typeof ctx.effect === 'function') {
+				ctx.effect(() => () => {
+					if (roleSourceRetry !== null) clearInterval(roleSourceRetry)
+					if (typeof disposeRoleSource === 'function') disposeRoleSource()
+				}, 'team-ops: @ 菜单里的角色')
+			}
+
+			// 第二处席位：输入框工具行左侧的「角色」按钮（`conversation.input.left`，list / replaceRisk: none）；
+			// 入口拿得到 `useInput`（草稿）与 `inputActions`（setDraft / submit）；老宿主没这个槽就静默跳过。
+			if (typeof ctx.slots.inject === 'function') {
+				try {
+					ctx.slots.inject('conversation.input.left', () => {
+						const dispose = ctx.slots.register(
+							{ name: 'conversation.input.left', id: 'company-roles', order: 200, label: '角色' },
+							// 席位那套标准 props 之外再塞一个 `sessions`（会话作用域里的 `conversation` 把手要用它）。
+							// `ctx.sessions` 拿不到时**不动**席位给的那一份（旧宿主 / 测试里都可能是这样）。
+							(seatProps) => el(RoleComposerEntry, {
+								...(seatProps === null || seatProps === undefined ? {} : seatProps),
+								...(ctx.sessions === undefined || ctx.sessions === null ? {} : { sessions: ctx.sessions }),
+							}),
+						)
+						return () => {
+							if (typeof dispose === 'function') dispose()
+						}
+					})
+				} catch (error) {
+					ctx.logger?.warn?.('team-ops：输入框那条槽挂不上（' + (error === null || error === undefined ? '未知错误' : String(error.message ?? error)) + '），「角色」按钮这一处跳过。')
+				}
+			}
+
+			// 第三处席位：输入框右侧的「润色」入口（`conversation.input.right`，渲染位置在模型选择器 / 发送键之前）。
+			// 与左侧那枚「角色」按钮同一套注册形状：标准 props 之外把 `ctx.sessions` 塞进去
+			// （判「草稿里有没有 @ 引用」要用会话作用域里的 `conversation` 把手）。
+			// 老宿主没有这个槽位时静默跳过（`inject` 自己抛就只 warn）——润色是增强，不该拖垮输入框。
+			if (typeof ctx.slots.inject === 'function') {
+				try {
+					ctx.slots.inject('conversation.input.right', () => {
+						const dispose = ctx.slots.register(
+							{ name: 'conversation.input.right', id: 'company-polish', order: 100, label: '润色' },
+							(seatProps) => el(PolishEntry, {
+								...(seatProps === null || seatProps === undefined ? {} : seatProps),
+								...(ctx.sessions === undefined || ctx.sessions === null ? {} : { sessions: ctx.sessions }),
+							}),
+						)
+						return () => {
+							if (typeof dispose === 'function') dispose()
+						}
+					})
+				} catch (error) {
+					ctx.logger?.warn?.('team-ops：输入框右侧那条槽挂不上（' + (error === null || error === undefined ? '未知错误' : String(error.message ?? error)) + '），「润色」这一处跳过。')
+				}
+			}
+
+		}
+
+		exports.apply = apply
+		// 硬依赖声明：cordis 的 Guard 拒绝未声明的服务属性访问；`sessions` 还必须在这里点名，
+		// 否则 apply 可能早于它就绪，一次性取值会永远拿不到当前会话（见 apply 里的说明）。
+		exports.inject = ['slots', 'sessions']
+		return exports
+		// **注意**：工厂与 `load({...})` 的闭合括号在 `17-polish.part` 末尾 —— ⑰ 排在本片段之后，
+		// 而它必须仍在工厂函数体内（函数声明会被提升，`return` 之后也能被 `apply` 用到）。

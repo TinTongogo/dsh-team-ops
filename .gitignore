@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+# 插件状态（人的话 / 角色开关 / 下架 / 交接快照 / 压缩检查点；结构化检查点在 docs/team/checkpoints/，那是要提交的）
+.ops/
+docs/
+# 项目级技能根（使用者在工作区里装的技能是你的数据，不进仓库）
+.dsh/
+

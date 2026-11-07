@@ -1,0 +1,1477 @@
+		// ── ⑩ 状态视图与任务板 ────────────────────────────────────────────────
+		/**
+		 * 面板的「最后在哪一块」记录（设计 3.1）。存储不可用（隐私模式 / 自检环境）时**静默回落成员块**。
+		 * 键 = `dsh-team-ops:panel-tab`，值 = `{ [scope]: ledger }`，按最近使用保留最多 8 个 scope。
+		 */
+		const PANEL_TAB_KEY = 'dsh-team-ops:panel-tab'
+		const PANEL_TAB_MAX = 8
+		const panelStorageOf = () => {
+			try {
+				return typeof sessionStorage === 'undefined' || sessionStorage === null ? null : sessionStorage
+			} catch {
+				return null
+			}
+		}
+		const panelTabLedgers = () => BLOCKS.map((block) => block.ledger)
+		const readPanelTabs = () => {
+			const storage = panelStorageOf()
+			if (storage === null) return {}
+			try {
+				const raw = storage.getItem(PANEL_TAB_KEY)
+				if (typeof raw !== 'string' || raw === '') return {}
+				const parsed = JSON.parse(raw)
+				return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+			} catch {
+				return {}
+			}
+		}
+		const writePanelTab = (scope, ledger) => {
+			const storage = panelStorageOf()
+			if (storage === null) return
+			try {
+				const map = readPanelTabs()
+				delete map[scope]
+				map[scope] = ledger
+				// 淘汰按"最久没用过的那个 scope"：对象键序就是插入序，删最前面那个即可。
+				const keys = Object.keys(map)
+				while (keys.length > PANEL_TAB_MAX) delete map[keys.shift()]
+				storage.setItem(PANEL_TAB_KEY, JSON.stringify(map))
+			} catch {
+				/* 存不进去只影响"下次打开恢复上次块"，不影响这一次 */
+			}
+		}
+		/**
+		 * 当前块 + 恢复逻辑：`scope` = `workspace + '|' + teamSessionId`（换会话 / 换工作区就换 scope）。
+		 * @param scope - 作用域串。
+		 * @returns `[ledger, setLedger]`。
+		 */
+		function usePanelTab(scope) {
+			const [ledger, setLedgerState] = React.useState(() => {
+				const saved = readPanelTabs()[scope]
+				return panelTabLedgers().includes(saved) ? saved : BLOCKS[0].ledger
+			})
+			/**
+			 * 切块：**先写记录再改 state**（写失败也不拦着切）。
+			 * @param next - 目标块的 ledger。
+			 */
+			const setLedger = (next) => {
+				const target = panelTabLedgers().includes(next) ? next : BLOCKS[0].ledger
+				writePanelTab(scope, target)
+				setLedgerState(target)
+			}
+			return [ledger, setLedger]
+		}
+
+		/**
+		 * 浮窗可达性的**唯一一份**：Esc 关、Tab 圈闭、打开时聚焦（优先 `[data-autofocus]`）、关闭后把焦点还给触发者。
+		 *
+		 * `useDetailModal` 是它的薄封装：详情浮窗自带 ↑↓←→，那套 keydown 仍留在 `useDetailModal`
+		 * （`keyboard:false`）—— 两份 keydown 会互相盖掉（自检的假 document 只有一个槽位，真浏览器里也会重复处理）。
+		 * @param open - 开着吗。
+		 * @param onClose - 关它。
+		 * @param options - `{ keyboard: false }` = 键盘监听不在这里装（详情浮窗用）。
+		 * @returns 浮窗元素的 ref（元素自己 `tabIndex=-1`，因而可编程聚焦）。
+		 */
+		function useModalA11y(open, onClose, options) {
+			const keyboard = options === undefined || options === null || options.keyboard !== false
+			const modalRef = React.useRef(null)
+			const restoreRef = React.useRef(null)
+			// 回调每次渲染都换新函数 ⇒ 放进 ref 里用"当前那一份"。
+			const closeRef = React.useRef(onClose)
+			closeRef.current = onClose
+			React.useEffect(() => {
+				if (open !== true) {
+					const back = restoreRef.current
+					restoreRef.current = null
+					try {
+						if (back !== null && back !== undefined && back.isConnected !== false && typeof back.focus === 'function') back.focus()
+					} catch {}
+					return
+				}
+				// **打开前焦点在哪**（= 触发它的那个控件）：关闭时还回去。
+				if (restoreRef.current === null) {
+					try {
+						const active = typeof document === 'undefined' || document === null ? null : document.activeElement
+						if (active !== null && active !== undefined && active !== modalRef.current) restoreRef.current = active
+					} catch {
+						/* 读不到 activeElement 就不记：关闭时不还焦点，比还错地方好 */
+					}
+				}
+				const node = modalRef.current
+				if (node === null || node === undefined) return
+				let target = node
+				try {
+					const preferred = typeof node.querySelector === 'function' ? node.querySelector('[data-autofocus]') : null
+					if (preferred !== null && preferred !== undefined) target = preferred
+				} catch {}
+				try {
+					if (typeof target.focus === 'function') target.focus()
+				} catch {}
+			}, [open])
+			React.useEffect(() => {
+				if (open !== true || keyboard !== true) return () => {}
+				if (typeof document === 'undefined' || document === null || typeof document.addEventListener !== 'function') return () => {}
+				const onKey = (event) => {
+					if (event === null || event === undefined) return
+					if (event.key === 'Escape') {
+						if (typeof event.preventDefault === 'function') event.preventDefault()
+						try {
+							closeRef.current?.()
+						} catch {
+							/* 关闭回调自己抛也不许把键盘路径搞坏 */
+						}
+						return
+					}
+					if (event.key === 'Tab') trapTab(event, modalRef.current)
+				}
+				document.addEventListener('keydown', onKey)
+				return () => document.removeEventListener('keydown', onKey)
+			}, [open, keyboard])
+			return modalRef
+		}
+
+		/**
+		 * 统一回执条（设计 ⑥.1 / ⑩）：成功 `role="status"`、失败 `role="alert"`，并带
+		 * `data-notice-slot` / `data-notice-tone`（qa 用同一套选择器判）。**失败可手动关闭**。
+		 * @param props - `{ slot, tone, lines, onRetry, onClose }`；`tone` 为 null 时不渲染。
+		 * @returns 节点或 null。
+		 */
+		function NoticeBar(props) {
+			if (props.tone === null || props.tone === undefined) return null
+			const isError = props.tone === 'error'
+			const lines = Array.isArray(props.lines) ? props.lines : []
+			return el(
+				'div',
+				{
+					className: 'cbv-notice cbv-notice--' + (isError ? 'error' : 'ok') + ' cbv-notice--slot',
+					role: isError ? 'alert' : 'status',
+					'aria-live': isError ? 'assertive' : 'polite',
+					'aria-atomic': 'true',
+					'data-notice-slot': props.slot,
+					'data-notice-tone': isError ? 'error' : 'ok',
+				},
+				el(
+					'div',
+					{ className: 'cbv-notice-body', key: 'lines' },
+					lines.map((line, index) => el('div', { className: 'cbv-md', key: 'l' + index }, markdownNodes(line, props.slot + '-notice' + index))),
+				),
+				typeof props.onRetry === 'function'
+					? el('button', { className: 'cbv-btn cbv-notice-btn', key: 'retry', type: 'button', 'data-notice-retry': '', onClick: () => props.onRetry() }, '重试')
+					: null,
+				typeof props.onClearFilters === 'function'
+					? el('button', { className: 'cbv-btn cbv-notice-btn', key: 'clear', type: 'button', 'data-notice-clear': '', onClick: () => props.onClearFilters() }, '清除筛选')
+					: null,
+				isError && typeof props.onClose === 'function'
+					? el('button', { className: 'cbv-btn cbv-notice-btn', key: 'close', type: 'button', 'data-notice-close': '', onClick: () => props.onClose() }, '关闭')
+					: null,
+			)
+		}
+
+		/**
+		 * 通用确认浮窗（设计 ⑥.2）：标题 + 正文 + 动词主按钮；默认焦点在「取消」，Esc 关。
+		 * **只在确认后由调用方发请求** —— 取消不产生任何网络动作。
+		 * @param props - `{ open, slot, title, lines, confirmLabel, danger, busy, error, onConfirm, onCancel }`。
+		 * @returns 节点或 null。
+		 */
+		function ConfirmDialog(props) {
+			const open = props.open === true
+			const busy = props.busy === true
+			const cancel = () => {
+				if (busy) return
+				if (typeof props.onCancel === 'function') props.onCancel()
+			}
+			const modalRef = useModalA11y(open, cancel)
+			if (!open) return null
+			const lines = Array.isArray(props.lines) ? props.lines : []
+			return el(
+				'div',
+				{ className: 'cbv-overlay', key: 'confirm-overlay', onClick: cancel },
+				el(
+					'div',
+					{
+						className: 'cbv-modal cbv-modal--confirm' + (props.danger === true ? ' cbv-modal--danger' : ''),
+						key: 'confirm-modal',
+						onClick: (event) => event.stopPropagation(),
+						role: 'dialog',
+						'aria-modal': 'true',
+						'aria-label': props.title,
+						ref: modalRef,
+						tabIndex: -1,
+						'data-confirm-dialog': props.slot,
+					},
+					el(
+						'div',
+						{ className: 'cbv-modal-body', key: 'body' },
+						el('div', { className: 'cbv-confirm-title', key: 'title' }, props.title),
+						lines.map((line, index) => el('div', { className: 'cbv-confirm-line cbv-md', key: 'l' + index }, markdownNodes(line, 'confirm-' + index))),
+						props.error === undefined || props.error === null || props.error === ''
+							? null
+							: el('div', { className: 'cbv-note cbv-note--danger', key: 'error', 'data-confirm-error': '' }, props.error),
+					),
+					el(
+						'div',
+						{ className: 'cbv-modal-actions cbv-confirm-actions', key: 'actions' },
+						el('button', { className: 'cbv-btn', key: 'cancel', type: 'button', 'data-autofocus': '', 'data-confirm-cancel': '', disabled: busy, onClick: cancel }, '取消'),
+						el(
+							'button',
+							{
+								// 与「取消」同一套底样式；破坏性动作才加 `--bad`（上一轮人的口径：弹窗按钮不搞主按钮强调）。
+								className: 'cbv-btn' + (props.danger === true ? ' cbv-btn--bad' : ''),
+								key: 'go',
+								type: 'button',
+								'data-confirm-go': '',
+								disabled: busy,
+								onClick: () => {
+									if (busy) return
+									if (typeof props.onConfirm === 'function') props.onConfirm()
+								},
+							},
+							busy ? (props.busyLabel === undefined ? '处理中…' : props.busyLabel) : props.confirmLabel,
+						),
+					),
+				),
+			)
+		}
+
+		/** 骨架卡（静态灰块，不做 shimmer；`aria-hidden`，读屏只听容器里那句「正在读取…」）。 */
+		const skeletonCardsOf = (count) =>
+			Array.from({ length: count }, (_, index) =>
+				el(
+					'div',
+					{ className: 'cbv-box cbv-skel', key: 'sk' + index, 'aria-hidden': 'true' },
+					el(
+						'div',
+						{ className: 'cbv-skel-top', key: 'top' },
+						el('span', { className: 'cbv-skel-avatar', key: 'av' }),
+						el(
+							'div',
+							{ className: 'cbv-skel-lines', key: 'lines' },
+							el('span', { className: 'cbv-skel-line cbv-skel-line--title', key: 't' }),
+							el('span', { className: 'cbv-skel-line', key: 's' }),
+						),
+					),
+					el('span', { className: 'cbv-skel-line cbv-skel-line--body', key: 'body' }),
+					el('span', { className: 'cbv-skel-line cbv-skel-line--bar', key: 'bar' }),
+				),
+			)
+		/**
+		 * 列表块的骨架（成员 / 角色 / 技能共用）：固定 3 张，外层 `aria-busy`。
+		 * @param props - `{ kind, label, count }`。
+		 * @returns 节点。
+		 */
+		function SkeletonList(props) {
+			const count = typeof props.count === 'number' ? props.count : 3
+			return el(
+				'div',
+				{ className: 'cbv-skel-block', 'data-skeleton': props.kind, 'aria-busy': 'true' },
+				el('span', { className: 'cbv-sr-only', key: 'say' }, props.label),
+				el('div', { className: 'cbv-mp-grid', key: 'grid' }, skeletonCardsOf(count)),
+			)
+		}
+		/**
+		 * 骨架延迟出现（设计 5.3：120ms 内完成就直接出内容，避免一闪）。
+		 * @param active - 是否处于加载态。
+		 * @returns 是否该画骨架。
+		 */
+		function useSkeletonVisible(active) {
+			const [visible, setVisible] = React.useState(false)
+			React.useEffect(() => {
+				if (active !== true) {
+					setVisible(false)
+					return () => {}
+				}
+				const timer = setTimeout(() => setVisible(true), 120)
+				return () => clearTimeout(timer)
+			}, [active])
+			return active === true && visible === true
+		}
+
+		/**
+		 * 块切换那一排（设计 3.5 / ⑩ `PanelTabs`）：`role="tablist"` + `role="tab"` + `aria-selected`，
+		 * roving `tabIndex`（选中项 0、其余 -1），`←/→` 循环、`Home/End` 到首尾。
+		 * `data-pane-block` 保持不变（qa 的选择器不受影响）。
+		 * @param props - `{ active, onSelect }`。
+		 * @returns 节点。
+		 */
+		function PanelTabs(props) {
+			const focusTab = (ledger) => {
+				try {
+					if (typeof document === 'undefined' || document === null || typeof document.querySelector !== 'function') return
+					const button = document.querySelector('[data-pane-block="' + ledger + '"]')
+					if (button !== null && button !== undefined && typeof button.focus === 'function') button.focus()
+				} catch {}
+			}
+			const onKeyDown = (event, index) => {
+				if (event === null || event === undefined) return
+				const key = event.key
+				let next = -1
+				if (key === 'ArrowRight') next = (index + 1) % BLOCKS.length
+				else if (key === 'ArrowLeft') next = (index - 1 + BLOCKS.length) % BLOCKS.length
+				else if (key === 'Home') next = 0
+				else if (key === 'End') next = BLOCKS.length - 1
+				if (next < 0) return
+				if (typeof event.preventDefault === 'function') event.preventDefault()
+				const block = BLOCKS[next]
+				props.onSelect(block.ledger)
+				focusTab(block.ledger)
+			}
+			return el(
+				'span',
+				{ className: 'cbv-tabs', key: 'tabs', role: 'tablist', 'aria-label': '团队状态分块' },
+				BLOCKS.map((block, index) =>
+					el(
+						'button',
+						{
+							key: block.ledger,
+							id: 'cbv-tab-' + block.ledger,
+							className: 'cbv-btn cbv-tab' + (props.active === block.ledger ? ' cbv-tab--on' : ''),
+							type: 'button',
+							role: 'tab',
+							'aria-selected': props.active === block.ledger ? 'true' : 'false',
+							'aria-controls': block.panelId,
+							// roving tabindex：Tab 只停一次（停在当前选中的那一枚）。
+							tabIndex: props.active === block.ledger ? 0 : -1,
+							// 块名落在 `data-` 上（不挂 title）：核对/自检按 `data-pane-block` 找这几个按钮。
+							'data-pane-block': block.ledger,
+							style:
+								props.active === block.ledger
+									? { borderColor: 'transparent', background: 'var(--cbv-a3)', color: 'var(--dsw-alias-label-primary)', fontWeight: 600 }
+									: undefined,
+							onClick: () => props.onSelect(block.ledger),
+							onKeyDown: (event) => onKeyDown(event, index),
+						},
+						block.label,
+					),
+				),
+			)
+		}
+
+		/**
+		 * 「团队状态」那一栏的外壳：**只负责作用域**（工作区 + 根会话）。
+		 *
+		 * `key={scope}` 包一层 `PanelBody`：换会话 / 换工作区时整块重挂（筛选、滚动、弹窗归零），
+		 * 同一 scope 内切块则**不重挂**（看的是同一批数据、人停在同一个上下文里）。
+		 * @param props - 席位 props（`sessions` / `slots`）。
+		 * @returns 面板。
+		 */
+		function StatusView(props) {
+			useComposerHidden(props.slots === undefined ? null : props.slots)
+			const store = props.sessions === undefined ? null : typeof props.sessions === 'function' ? props.sessions() : props.sessions
+			const workspace = useCurrentWorkspace(store)
+			const sessionId = useCurrentSessionId(store)
+			// 团队状态挂在**根会话**上（子智能体对话里点开面板也要读得到领队那一份）。
+			const teamSessionId = teamSessionIdOf(store, sessionId)
+			const scope = workspace + '|' + teamSessionId
+			return el(PanelBody, { key: scope, sessions: props.sessions, slots: props.slots, workspace, sessionId, teamSessionId, scope })
+		}
+
+		/**
+		 * 面板本体：块切换 + 首屏状态 + **保活渲染**（设计 3.3）。
+		 *
+		 * 首次激活某块才挂载；挂载后**不卸载**，用 `hidden` 隐藏（非当前块 `aria-hidden` 不是必须 —— `hidden` 已足够）。
+		 * 只有当前块 `active=true`，各块取数 effect 只在 `active` 为真时跑 ⇒ 非当前块不因窗口 focus 重复取数。
+		 * @param props - `{ sessions, slots, workspace, sessionId, teamSessionId, scope }`（由 `StatusView` 给）。
+		 * @returns 面板。
+		 */
+		function PanelBody(props) {
+			const workspace = props.workspace
+			const teamSessionId = props.teamSessionId
+			const scope = props.scope
+			// **拼参数用同一套**（`paneQueryOf`）：`/status` 在拿不到工作区时会**按会话**回落推断。
+			const target = STATUS_ENDPOINT + paneQueryOf(workspace, teamSessionId)
+			const [tab, setTab] = usePanelTab(scope)
+			// 已挂载（保活）的块：首次激活才加入，之后不删。
+			const [visited, setVisited] = React.useState(() => [tab])
+			const [tick, setTick] = React.useState(0)
+			const [snapshot, setSnapshot] = React.useState({ phase: 'loading' })
+			const [notice, setNotice] = React.useState(null)
+			const paneFill = usePaneHeight()
+			/** 切块：**块本身不卸载**，只换哪一块 active。 */
+			const selectTab = (ledger) => {
+				setTab(ledger)
+				setVisited((list) => (list.includes(ledger) ? list : [...list, ledger]))
+			}
+			// 从存储恢复出来的块也要进 visited（首帧就渲染它）。
+			React.useEffect(() => {
+				setVisited((list) => (list.includes(tab) ? list : [...list, tab]))
+			}, [tab])
+
+			/**
+			 * **重读的触发**（这里没有「刷新」按钮）：窗口重新获得焦点、面板重新可见，两条都只 `+1`。
+			 */
+			React.useEffect(() => {
+				const bump = () => {
+					invalidatePanes()
+					setTick((value) => value + 1)
+				}
+				const onVisible = () => {
+					try {
+						if (typeof document !== 'undefined' && document !== null && document.visibilityState !== undefined && document.visibilityState !== 'visible') return
+					} catch {
+						/* 读不到可见性就当它可见（宁可多取一次） */
+					}
+					bump()
+				}
+				const offs = []
+				try {
+					if (typeof window !== 'undefined' && window !== null && typeof window.addEventListener === 'function') {
+						window.addEventListener('focus', bump)
+						offs.push(() => window.removeEventListener('focus', bump))
+					}
+					if (typeof document !== 'undefined' && document !== null && typeof document.addEventListener === 'function') {
+						document.addEventListener('visibilitychange', onVisible)
+						offs.push(() => document.removeEventListener('visibilitychange', onVisible))
+					}
+				} catch {
+					/* 环境不认这两个事件就算（面板其余部分照常） */
+				}
+				return () => {
+					for (const off of offs) {
+						try {
+							off()
+						} catch {
+							/* 卸载时的失败不影响别的 */
+						}
+					}
+				}
+			}, [])
+
+			/**
+			 * **切到新会话/新工作区时并行预取**三个读端点（成员 / 技能 / 任务看板）。
+			 */
+			React.useEffect(() => {
+				if (typeof fetch !== 'function' || workspace === '') return undefined
+				const teamQuery = paneQueryOf(workspace, teamSessionId)
+				for (const endpoint of [MEMBERS_ENDPOINT, SKILLS_ENDPOINT, TEAM_TASKS_ENDPOINT]) {
+					try {
+						void getJsonCached(endpoint + teamQuery, { force: true }).catch(() => null)
+					} catch {
+						/* 预取失败不影响任何东西：真正需要时各块自己会再拉一次 */
+					}
+				}
+				return undefined
+			}, [workspace, teamSessionId])
+
+			React.useEffect(() => {
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setSnapshot({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				getJsonCached(target)
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null) {
+							setSnapshot({ phase: 'error', error: 'HTTP ' + response.status + '：响应不是 JSON' })
+							return
+						}
+						if (payload.ok === true) {
+							setSnapshot({ phase: 'ready', data: payload })
+							return
+						}
+						setSnapshot({ phase: 'error', error: typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status })
+					})
+					.catch((error) => {
+						if (cancelled) return
+						setSnapshot({ phase: 'error', error: '' + error })
+					})
+				return () => {
+					cancelled = true
+				}
+			}, [tick, target])
+
+			const data = snapshot.phase === 'ready' ? snapshot.data : null
+			// 首屏读失败时给一枚「重读」（宿主刚重启那会儿可恢复）。
+			const head =
+				snapshot.phase === 'error'
+					? el(
+							'div',
+							{ style: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600, fontSize: '14px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+							'读不到状态：' + snapshot.error,
+							el(
+								'button',
+								{ className: 'cbv-btn', key: 'retry', type: 'button', 'data-pane-retry': 'status', onClick: () => { invalidatePanes(); setTick((value) => value + 1) } },
+								'重读',
+							),
+						)
+					: null
+
+			const statusSource = data === null ? '' : text(data.source)
+			const sourceNote =
+				statusSource === '' || statusSource === 'native'
+					? null
+					: el(
+							'div',
+							{ className: 'cbv-pane-note cbv-md', key: 'status-source', 'data-status-source': statusSource },
+							markdownNodes(text(data.sourceLine) === '' ? '状态读的是遗留文件，以原生账为准。' : text(data.sourceLine), 'status-source'),
+						)
+
+			// 顶栏一行到底：块切换 | 动作 | 工作区完整路径（不单独占行）。
+			const target_ = data === null ? '' : typeof data.docsPath === 'string' ? data.docsPath : typeof data.workspace === 'string' ? data.workspace : ''
+			const projectLabel = target_ === '' ? '项目路径' : target_
+			const projectTitle = target_ === '' ? '这个工作区的路径还没取到' : '点开：' + target_ + '（主进程开本地目录；开不了就只把路径复制给你）'
+			const openProject = () => {
+				if (target_ === '') {
+					setNotice('还没取到项目路径')
+					return
+				}
+				const copy = () => {
+					try {
+						const nav = typeof navigator === 'undefined' ? undefined : navigator
+						if (nav !== undefined && nav.clipboard !== undefined && typeof nav.clipboard.writeText === 'function') {
+							nav.clipboard.writeText(target_).then(
+								() => setNotice('已复制路径：' + target_),
+								() => setNotice('路径：' + target_),
+							)
+							return
+						}
+					} catch {}
+					setNotice('路径：' + target_)
+				}
+				if (typeof fetch !== 'function') {
+					copy()
+					return
+				}
+				const url = OPEN_ENDPOINT + (workspace === '' ? '' : '?workspace=' + encodeURIComponent(workspace))
+				fetch(url, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json', accept: 'application/json' },
+					credentials: 'same-origin',
+					body: JSON.stringify({ path: target_ }),
+				})
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ payload }) => {
+						if (payload !== null && payload.ok === true) {
+							setNotice('已在本机打开：' + target_)
+							return
+						}
+						const why = payload === null || typeof payload.error !== 'string' ? '主进程没能打开' : payload.error
+						setNotice(why + ' —— 已复制路径')
+						copy()
+					})
+					.catch(() => {
+						setNotice('主进程没能打开 —— 已复制路径')
+						copy()
+					})
+			}
+			const actions = el(
+				'div',
+				{ className: 'cbv-toolbar-main', style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', flex: 'none' } },
+				el(PanelTabs, { active: tab, onSelect: selectTab }),
+				// 工作区按钮压尾（块切换 → 动作 → 工作区）。
+				el('button', { className: 'cbv-btn', type: 'button', title: projectTitle, onClick: openProject }, projectLabel),
+				notice === null ? null : el('span', { style: { fontSize: '13px', color: 'var(--dsw-alias-label-tertiary)' } }, notice),
+			)
+
+			/** 某一块的节点（只有当前块 `active`；其余保持挂载但 hidden）。 */
+			const contentOf = (block) => {
+				const active = block.ledger === tab
+				if (block.ledger === 'members') return el(MembersView, { sessions: props.sessions, reload: tick, active })
+				if (block.ledger === 'roles') return el(RolesView, { sessions: props.sessions, reload: tick, active })
+				if (block.ledger === 'skills') return el(SkillsView, { sessions: props.sessions, reload: tick, active })
+				if (block.ledger === 'board') return el(TaskBoardView, { sessions: props.sessions, slots: props.slots, reload: tick, active })
+				return el(LedgerView, { spec: block.spec, sessions: props.sessions, slots: props.slots, hideComposer: false, showHeader: false, reload: tick, active })
+			}
+			const panelOf = (block) => {
+				const active = block.ledger === tab
+				return el(
+					'div',
+					{
+						key: block.ledger,
+						id: block.panelId,
+						className: 'cbv-block-panel',
+						role: 'tabpanel',
+						'aria-labelledby': 'cbv-tab-' + block.ledger,
+						tabIndex: active ? 0 : -1,
+						// `hidden` 负责"看不见也 Tab 不到"；CSS 里还有一条 `[hidden]{display:none}` 兜底。
+						hidden: active ? undefined : true,
+						'data-panel-block': block.ledger,
+						'data-panel-active': active ? 'true' : 'false',
+					},
+					contentOf(block),
+				)
+			}
+			// `visited` 存的是 ledger 字符串；渲染时要换回块对象（保持"已挂载顺序"）。
+			const mountedLedgers = visited.includes(tab) ? visited : [...visited, tab]
+			const mountedBlocks = mountedLedgers.map((ledger) => BLOCKS.find((block) => block.ledger === ledger)).filter((block) => block !== undefined)
+
+			return el(
+				'div',
+				{
+					className: 'cbv-root',
+					'data-team-ops-pane': '',
+					'data-pane-mark': PANE_MARK,
+					// 块壳的机器可核标记（设计 5.4）：当前块 / 作用域 / 已挂载块列表。
+					'data-panel-tab': tab,
+					'data-panel-scope': scope,
+					'data-panel-visiting': mountedLedgers.join(' '),
+					style: paneFill === null ? undefined : { height: paneFill + 'px' },
+				},
+				head,
+				sourceNote,
+				actions,
+				el('div', { className: 'cbv-panels', key: 'panels', style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: '0' } }, mountedBlocks.map(panelOf)),
+			)
+		}
+
+		/**
+		 * 一条条目**属于哪一栏**（浮窗标题用）：按 `field`（缺省 `phase`）在分栏表里找它那一栏的标签。
+		 *
+		 * 为什么要印在浮窗标题里：`← →` 是"切换分栏"，而浮窗正文只有那一张卡 —— 不写栏名的话，
+		 * "换了一栏"与"栏内翻了一条"看起来一模一样（现场就是这么把它误判成翻页的）。
+		 * @param columns - 分栏表（`{ key, label, items }`）。
+		 * @param item - 当前那一条。
+		 * @param field - 分栏键取自条目的哪个字段（缺省 `phase`；团队那一档是 `status`）。
+		 * @returns 栏名；认不出返回空串（那就只印编号，不臆造）。
+		 */
+		const labelOfColumn = (columns, item, field) => {
+			if (!Array.isArray(columns) || item === null || item === undefined) return ''
+			const key = text(item[field === undefined ? 'phase' : field])
+			for (const column of columns) {
+				if (text(column.key) === key) return text(column.label)
+			}
+			return ''
+		}
+
+		/**
+		 * 详情浮窗的键盘 / 焦点行为 —— 三块文件**共用同一份**：
+		 * Esc 关、**↑ ↓ 在本栏内翻页**（与那两个按钮同一件事）、**← → 切换分栏**（人的指定：
+		 * 上下管"这一栏里的下一条"，左右管"换一栏"）、打开后焦点移进浮窗（键盘用户不必从头 Tab）、
+		 * **关掉之后把焦点还给打开它的那张卡**、**Tab 圈在浮窗内**（浮窗是 `aria-modal` 的，
+		 * 焦点跑到遮罩后面的列表上就等于"用键盘摸到了一屏看不见的东西"）。
+		 * @param detail - 当前打开的条目（null = 关着）。
+		 * @param onClose - 关闭（Esc）。
+		 * @param onStep - 栏内翻页 ±1（两个按钮用）。
+		 * @param onColumnStep - **切换分栏** ±1（← → 用）；不给就退回 `onStep`，行为与从前一致。
+		 * @returns 浮窗元素要挂的 ref（元素自己 `tabIndex=-1`，因而可编程聚焦）。
+		 */
+		function useDetailModal(detail, onClose, onStep, onColumnStep) {
+			const modalRef = React.useRef(null)
+			// 焦点圈闭 / Esc 归还焦点：与其余浮窗**共用同一份**（`useModalA11y`）。
+			// 键盘监听仍在这一处装（详情浮窗自带 ↑↓←→，`keyboard:false` 避免两份 keydown 打架）。
+			const a11yRef = useModalA11y(detail !== null, onClose, { keyboard: false })
+			modalRef.current = a11yRef.current
+			// 回调每次渲染都换新函数 ⇒ 放进 ref 里用"当前那一份"，免得把它们写进依赖后每轮都重挂监听。
+			const handlers = React.useRef({ onStep, onClose, onColumnStep })
+			handlers.current = { onStep, onClose, onColumnStep }
+			React.useEffect(() => {
+				if (detail === null) return () => {}
+				if (typeof document === 'undefined' || document === null || typeof document.addEventListener !== 'function') return () => {}
+				const onKey = (event) => {
+					if (event === null || event === undefined) return
+					if (event.key === 'Escape') handlers.current.onClose()
+					// **↑ ↓ = 本栏内翻页**（与那两个按钮同一件事），**← → = 切换分栏**（跨栏走一格）。
+					else if (event.key === 'ArrowUp') handlers.current.onStep(-1)
+					else if (event.key === 'ArrowDown') handlers.current.onStep(1)
+					else if (event.key === 'ArrowLeft') (handlers.current.onColumnStep ?? handlers.current.onStep)(-1)
+					else if (event.key === 'ArrowRight') (handlers.current.onColumnStep ?? handlers.current.onStep)(1)
+					else if (event.key === 'Tab') trapTab(event, modalRef.current)
+				}
+				document.addEventListener('keydown', onKey)
+				return () => document.removeEventListener('keydown', onKey)
+			}, [detail])
+			return modalRef
+		}
+
+		/**
+		 * 把 Tab 圈在浮窗内：焦点在**最后一个**可聚焦元素上再按 Tab ⇒ 回第一个（Shift+Tab 反向同理）。
+		 *
+		 * 为什么要自己圈：浮窗是 `aria-modal="true"` 的，而遮罩后面的列表没有被 `inert` 掉 ——
+		 * 不圈的话 Tab 会跑到看不见的卡片上。可聚焦元素按浮窗当前那一份 DOM 现查（浮窗里翻页会换内容）。
+		 * @param event - `keydown` 事件（可能带 `shiftKey`）。
+		 * @param node - 浮窗元素（`modalRef.current`）；不是元素时什么都不做。
+		 */
+		const trapTab = (event, node) => {
+			try {
+				if (node === null || node === undefined || typeof node.querySelectorAll !== 'function') return
+				const all = Array.from(node.querySelectorAll('button,[href],input,select,textarea,[tabindex]'))
+				const focusables = all.filter((el) => el.tabIndex >= 0 && el.disabled !== true)
+				if (focusables.length === 0) return
+				const first = focusables[0]
+				const last = focusables[focusables.length - 1]
+				const active = typeof document === 'undefined' || document === null ? null : document.activeElement
+				const inside = active !== null && active !== undefined && typeof node.contains === 'function' && node.contains(active)
+				if (event.shiftKey === true) {
+					if (!inside || active === first) {
+						event.preventDefault()
+						last.focus()
+					}
+					return
+				}
+				if (!inside || active === last) {
+					event.preventDefault()
+					first.focus()
+				}
+			} catch {
+				/* 圈不住也不许把浮窗搞坏：按键照原样走 */
+			}
+		}
+
+		/**
+		 * 详情浮窗本体 —— 三块文件**共用同一份**（同一套遮罩、表头、翻页与正文渲染）。
+		 *
+		 * 写成**普通函数**（不是组件）是有意的：调用方把它内联进自己的渲染树，产出的节点与
+		 * "各写一遍这段 markup"完全一致，而实现只有一处。
+		 * @param spec - 这一条属于哪份文件（决定正文用哪张卡片）。
+		 * @param item - 正在看的那一条。
+		 * @param pool - 可翻页的那一组（= 该项所在那一栏，不跨栏）。
+		 * @param index - 这一条在 pool 里的下标（-1 = 不在其中，两个翻页按钮都不可点）。
+		 * @param onStep - 翻页 ±1。
+		 * @param onClose - 关闭。
+		 * @param modalRef - 浮窗元素的 ref（见 useDetailModal）。
+		 * @returns 浮窗节点。
+		 */
+		const detailOverlayOf = (spec, item, pool, index, onStep, onClose, modalRef, groupLabel) => {
+			const ledger = spec === undefined || spec === null ? '' : spec.ledger
+			const ordered = Array.isArray(pool) ? pool : []
+			return el(
+				'div',
+				{ className: 'cbv-overlay', key: 'overlay', onClick: onClose },
+				el(
+					'div',
+					{
+						className: 'cbv-modal',
+						onClick: (event) => event.stopPropagation(),
+						ref: modalRef,
+						role: 'dialog',
+						'aria-modal': 'true',
+						'aria-label': (text(item.id) || '条目') + ' 详情',
+						tabIndex: -1,
+					},
+					el(
+						'div',
+						{ className: 'cbv-modal-head', key: 'head' },
+						// 标题占满左侧，三个操作按钮聚在右上角：翻页与关闭在同一处，手不用来回找。
+						el(
+							'span',
+							{ className: 'cbv-modal-title', key: 'title' },
+							// **带上"是哪一栏"**（换栏这件事得看得见 —— 否则 ← → 看起来跟翻页一样），
+							// 再给「栏内第几条」。不给总数：翻页不跨栏，递一个跨栏总数会误导成还有别处可翻。
+							(groupLabel === undefined || groupLabel === '' ? '' : groupLabel + '　·　') +
+								(text(item.id) || '(无编号)') +
+								(index < 0 ? '' : '　第 ' + (index + 1) + ' 条'),
+						),
+						el(
+							'div',
+							{ className: 'cbv-modal-actions', key: 'actions' },
+							// 键盘只在**浮窗开着**时生效（人的指令：这句原来写在看板底部，而那儿按了没反应）⇒
+							// 提示就写在浮窗里、紧挨着那几个按钮，看板底部不再重复。
+							el('span', { className: 'cbv-modal-keys', key: 'keys' }, inlineNodes('`↑ ↓` 本栏内翻页 · `← →` 切换分栏 · `Esc` 关', 'keys')),
+							el('button', { className: 'cbv-btn', key: 'prev', type: 'button', disabled: index <= 0, onClick: () => onStep(-1) }, '上一条'),
+							el('button', { className: 'cbv-btn', key: 'next', type: 'button', disabled: index < 0 || index >= ordered.length - 1, onClick: () => onStep(1) }, '下一条'),
+							el('button', { className: 'cbv-btn', key: 'close', type: 'button', onClick: onClose }, '关闭'),
+						),
+					),
+					el('div', { className: 'cbv-modal-body', key: 'body' }, CARDS[ledger](item, true, () => {}, 'modal#' + text(item.id))),
+				),
+			)
+		}
+
+
+		/**
+		 * 「任务看板」块：**只有一档** —— 本会话 Agent Teams 的共享任务板（原生三栏）。
+		 *
+		 * 这一块从前有两个来源（本插件那份工作区看板 + 原生任务板），界面上靠"来源分档"切；
+		 * 本插件那份看板文件**没有写入者了**（任务在原生那本账上），所以分档与那一档的视图
+		 * （按 `phase` 的里程碑视图）都已撤掉 —— 留一半会让人以为"板子是空的"。
+		 * **本文件不发明映射表**：原生是 `pending / in_progress / completed`，面板照它的三档画，
+		 * 不把 `in_progress` 折成我们的"待验收"。
+		 *
+		 * 筛选**只从原生给的字段里选档**（可认领 / 被阻塞 / 有依赖 / 写盘面重叠 + 一栏搜索）。
+		 * 「被阻塞」与「有依赖」是**两件事**（人的口径）：有依赖是事实（`blockedBy` 非空，完成也在），
+		 * 被阻塞是状态（依赖没完成）；原生只给 `ready`、没有 blocked 字段 ⇒ 用同一份原生字段推一次，
+		 * 判定只住 `dependencyBlockedOf` 一处（见 09-words）。原生没有优先级与时间字段 ⇒ 卡上印不出来。
+		 *
+		 * 这一档**只读**：认领 / 完成 / 改依赖 / 改归属都是 `team_task_*` 那套会话工具的活
+		 * （CAS + 授权 + 留痕的完整事务），面板只把**同一份视图**摆出来。
+		 * @param props - 与其余块一样：`sessions` / `slots` / `reload`（面板的重读计数）。
+		 */
+		function TaskBoardView(props) {
+			const active = props.active !== false
+			const store = props.sessions === undefined ? null : typeof props.sessions === 'function' ? props.sessions() : props.sessions
+			const workspace = useCurrentWorkspace(store)
+			const sessionId = useCurrentSessionId(store)
+			// 团队任务按**根会话**取（子智能体对话里点开面板也要看得到领队那一份）。
+			const teamSessionId = teamSessionIdOf(store, sessionId)
+			const [team, setTeam] = React.useState({ phase: 'loading' })
+			// 协作读数（可选）：拿不到就不显示那一行，不占位、不报错（它是辅助信息，不挡板面）。
+			const [collab, setCollab] = React.useState({ phase: 'loading' })
+			// 本块自己的重读计数（错误态那枚「重读」用它；面板的 `props.reload` 仍是主触发）。
+			const [localTick, setLocalTick] = React.useState(0)
+			// 这一块的筛选：分档 chip（可认领 / 被阻塞 / 有依赖 / 写盘面重叠）+ 搜索（编号 / 主题 / owner / 依赖 / 写盘面）。
+			// 任务过十条时，"先干哪条"要在这一屏上看出来 —— 肉眼看三栏不是筛选。
+			const [stage, setStage] = React.useState('all')
+			const [query, setQuery] = React.useState('')
+			const showSkeleton = useSkeletonVisible(team.phase === 'loading')
+
+			// 详情浮窗：`null` = 关着；否则 `{ id }`（**存 id 不存行** —— 重取之后浮窗里那份不会变成旧快照）。
+			const [detail, setDetail] = React.useState(null)
+			// 翻页要在 keydown 回调里读"当前这一份"，用 ref 承载（与 `LedgerView` 同一条做法）。
+			const navRef = React.useRef({ ordered: [], index: -1 })
+			// 键盘（← → **切换分栏**、Esc 关）与打开后聚焦走共用那一份；两个按钮仍在栏内翻。
+			const modalRef = useDetailModal(detail, () => setDetail(null), (offset) => step(offset), (offset) => columnStep(offset))
+
+			React.useEffect(() => {
+				if (!active) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setTeam({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				getJsonCached(teamTasksUrlOf(workspace, teamSessionId))
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null) {
+							setTeam((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: 'HTTP ' + response.status + '：响应不是 JSON' }))
+							return
+						}
+						// 这一条端点**永远 200**（团队那半边读不到也算正常答），所以这里只认 `ok`。
+						if (payload.ok === true) {
+							setTeam({ phase: 'ready', data: payload })
+							return
+						}
+						setTeam((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }))
+					})
+					.catch((error) => {
+						if (cancelled) return
+						setTeam((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: '' + error }))
+					})
+				return () => {
+					cancelled = true
+				}
+			}, [props.reload, localTick, workspace, sessionId, active])
+
+			// 协作读数：与任务板并行取；失败静默（辅助信息，不挡板面）。
+			React.useEffect(() => {
+				if (!active) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') return () => {}
+				getJsonCached(collabUrlOf(workspace, teamSessionId))
+					.then((response) => response.json().then((payload) => payload, () => null))
+					.then((payload) => {
+						if (cancelled) return
+						if (payload === null || payload.ok !== true) {
+							setCollab({ phase: 'error' })
+							return
+						}
+						setCollab({ phase: 'ready', data: payload })
+					})
+					.catch(() => {
+						if (!cancelled) setCollab({ phase: 'error' })
+					})
+				return () => {
+					cancelled = true
+				}
+			}, [props.reload, workspace, teamSessionId, active])
+
+			// 本插件看板已撤（`.ops/board.json` 无写入者）：不再发无人消费的请求，也不再算只给已撤视图用的 `phaseSpec`。
+
+			const teamData = team.phase === 'ready' ? team.data : null
+			const teamRows = teamData !== null && Array.isArray(teamData.rows) ? teamData.rows : []
+			const teamAvailable = teamData !== null && teamData.available === true
+			const teamReason = teamData !== null && typeof teamData.reason === 'string' ? teamData.reason : team.phase === 'error' ? team.error : ''
+			const teamWarnings = teamData !== null && Array.isArray(teamData.warnings) ? teamData.warnings : []
+			// 原生按条数截断过的字段（载荷 `truncations`）：卡上逐条印"只列了前 N 条（共 M 条）"。
+			const teamTruncations = teamData !== null && Array.isArray(teamData.truncations) ? teamData.truncations : []
+			// 任务与成员只在原生 Agent Teams 一档；不再有"两个来源"，旧里程碑档已无写入者。
+			const source = 'team'
+
+			const stageSpec = TEAM_TASK_STAGES.find((item) => item.key === stage) ?? TEAM_TASK_STAGES[0]
+			const needle = query.trim().toLowerCase()
+			// 「被阻塞」要拿**同一份载荷里其他任务的状态**才能推（原生没有 blocked 字段）——
+			// 这张表就是那份索引；不在表里的依赖按"没完成"算（见 `dependencyBlockedOf`）。
+			const taskStatusById = new Map(teamRows.map((row) => [text(row.id), text(row.status)]))
+			// 分档与搜索**都只看原生给的那几个字段**（不自己算"可认领"：`ready` 是原生算的）。
+			const visibleRows = teamRows.filter(
+				(row) => stageSpec.match(row, taskStatusById) && (needle === '' || haystackOf(row).indexOf(needle) !== -1),
+			)
+			const stageCount = (item) => teamRows.filter((row) => item.match(row, taskStatusById)).length
+			const clearFilters = () => {
+				setStage('all')
+				setQuery('')
+			}
+			const retry = () => {
+				invalidatePanes()
+				setLocalTick((value) => value + 1)
+			}
+
+			/** 团队那一半：三栏（照原生状态），卡上只印原生给的那几个字段。 */
+			const columnOf = (column) => {
+				const items = visibleRows.filter((row) => text(row.status) === column.key)
+				return el(
+					'div',
+					{ className: 'cbv-col', key: column.key, 'data-tt-col': column.key },
+					el(
+						'div',
+						{ className: 'cbv-col-head', key: 'head' },
+						el('span', { className: 'cbv-col-name', key: 'name' }, column.label),
+						el('span', { className: 'cbv-col-count', key: 'count' }, '' + items.length),
+					),
+					el(
+						'div',
+						{ className: 'cbv-col-body', key: 'body' },
+						items.length === 0
+							? el('div', { className: 'cbv-empty', key: 'none' }, '这一栏没有')
+							: items.map((row, index) => teamTaskCard(row, index, false, () => setDetail({ id: text(row.id) }))),
+					),
+				)
+			}
+
+			/**
+			 * 团队任务的**详情浮窗**：外壳与看板那一份（`detailOverlayOf`）同形 —— 标题给"栏内第几条"、
+			 * 右上角 `上一条 / 下一条 / 关闭`、正文是那张卡摊开的形态（`isOpen = true`）。
+			 * @param row - 当前这一条。
+			 * @param pool - 它所在那一栏的条目（翻页只在这几条里走）。
+			 * @param index - 在当前那一栏里的位置（0 起；-1 = 找不到）。
+			 * @param onStep - 翻页（±1）。
+			 * @param onClose - 关闭。
+			 * @param modalRef - 浮窗元素的 ref（见 `useDetailModal`）。
+			 */
+			const teamTaskOverlayOf = (row, pool, index, onStep, onClose, modalRef, groupLabel) => {
+				const ordered = Array.isArray(pool) ? pool : []
+				const id = text(row.id)
+				return el(
+					'div',
+					{ className: 'cbv-overlay', key: 'tt-overlay', onClick: onClose },
+					el(
+						'div',
+						{
+							className: 'cbv-modal',
+							onClick: (event) => event.stopPropagation(),
+							ref: modalRef,
+							role: 'dialog',
+							'aria-modal': 'true',
+							'aria-label': (id || '团队任务') + ' 详情',
+							tabIndex: -1,
+							'data-tt-dialog': id,
+						},
+						el(
+							'div',
+							{ className: 'cbv-modal-head', key: 'head' },
+							el(
+								'span',
+								{ className: 'cbv-modal-title', key: 'title' },
+								// 同一口径：**栏名 + 栏内第几条**（"换栏"看得见）。
+								(groupLabel === undefined || groupLabel === '' ? '' : groupLabel + '　·　') +
+									(id || '(无编号)') +
+									(index < 0 ? '' : '　第 ' + (index + 1) + ' 条'),
+							),
+							el(
+								'div',
+								{ className: 'cbv-modal-actions', key: 'actions' },
+								// 同一句话（这一支的头也是同一套排版）。
+								el('span', { className: 'cbv-modal-keys', key: 'keys' }, inlineNodes('`↑ ↓` 本栏内翻页 · `← →` 切换分栏 · `Esc` 关', 'keys')),
+								el('button', { className: 'cbv-btn', key: 'prev', type: 'button', disabled: index <= 0, onClick: () => onStep(-1) }, '上一条'),
+								el('button', { className: 'cbv-btn', key: 'next', type: 'button', disabled: index < 0 || index >= ordered.length - 1, onClick: () => onStep(1) }, '下一条'),
+								el('button', { className: 'cbv-btn', key: 'close', type: 'button', onClick: onClose }, '关闭'),
+							),
+						),
+						el('div', { className: 'cbv-modal-body', key: 'body' }, teamTaskCard(row, index, true, () => {})),
+					),
+				)
+			}
+
+			/**
+			 * 一张团队任务卡：编号 / 主题 / 归属 / 依赖与就绪 / 写盘面 / 版本；**全是原生给的字段**。
+			 *
+			 * 与看板那张卡同一条规矩：**整张卡可点**（`CARD_SHELL_PROPS` 给 `role=button` / `tabIndex` /
+			 * Enter·Space），点开是**详情浮窗**（`上一条 / 下一条` 在该条所在那一栏内走，← → 切换分栏、Esc 关）
+			 * —— 与「工作区看板」那一半的操作完全一致。`isOpen` 那一支是**浮窗里**用的形态：
+			 * 把原生那几个字段摊全（status 原文 / revision / ownerName / ready / blockedBy / writeScopes /
+			 * 写盘面重叠告警逐条 / description 原文（**与 subject 同一段时不重复印**）），卡本身不再可点。
+			 */
+			// 交接单按任务号关联（工具 `handoff` 的可选 `task` 字段）；同一任务多条取最近一条。
+			const handoffByTask = (() => {
+				const map = new Map()
+				if (collab.phase === 'ready' && collab.data !== null && Array.isArray(collab.data.handoffs)) {
+					for (const note of collab.data.handoffs) {
+						const key = text(note.task)
+						if (key !== '') map.set(key, note)
+					}
+				}
+				return map
+			})()
+			// 冲突任务编号：写盘面重叠告警原文里的 `task-N` / `T-N`（不自己编号）。
+			const conflictIdsOf = (row) => {
+				const source = Array.isArray(row.writeScopeWarnings) ? row.writeScopeWarnings.join(' ') : ''
+				return [...new Set([...source.matchAll(/(?:task-|T-)\d+/g)].map((match) => match[0]))]
+			}
+
+			const teamTaskCard = (row, index, isOpen, onToggle) => {
+				const id = text(row.id)
+				const status = text(row.status)
+				const blockedBy = Array.isArray(row.blockedBy) ? row.blockedBy.filter((value) => text(value) !== '') : []
+				const scopes = Array.isArray(row.writeScopes) ? row.writeScopes.filter((value) => text(value) !== '') : []
+				const scopeWarnings = Array.isArray(row.writeScopeWarnings) ? row.writeScopeWarnings.filter((value) => text(value) !== '') : []
+				// 原生按**条数**截断过哪几个数组（载荷 `truncations` 逐条给）⇒ 卡上要说出来：
+				// 不说的话会出现"列出来的依赖都满足、可这条仍是等依赖"这种读不通的话（`ready` 是按**全部**依赖算的）。
+				const truncations = teamTruncations.filter((item) => text(item.id) === id)
+				// **原生那边 `subject` 与 `description` 是同一段文字**（Agent Teams 的两格同义）：
+				// 卡上已经用 `cbv-desc` 印了 subject ⇒ 同一段就别再印一遍（现场：浮窗里上下两块一模一样）。
+				const subject = text(row.subject)
+				const description = text(row.description)
+				const descriptionIsDuplicate = description !== '' && description.trim() === subject.trim()
+				// 「被阻塞」是状态（与「有依赖」这个事实分开）：依赖没完成才叫被阻塞；依赖都完成就不算。
+				// `ready` 是**原生算的**（pending 且依赖全完成）：可认领那一档照印，不自己再算一遍。
+				const blockedNow = dependencyBlockedOf(row, taskStatusById)
+				const pendingState = status === 'completed'
+					? null
+					: blockedNow
+						? el('span', { className: 'cbv-chip cbv-chip--exception', key: 'blocked' }, '被阻塞')
+						: row.ready === true
+							? el('span', { className: 'cbv-chip cbv-chip--ok', key: 'ready' }, '可认领')
+							: null
+				// 折叠卡**只印任务描述**：编号 / 归属 / 版本 / 依赖 / 写盘面 / 检查点 / 告警都是详细内容，
+				// 点卡片开浮窗才展示（人的指令：卡片不要摊详细内容）。
+				const handoff = handoffByTask.get(id)
+				const conflicts = conflictIdsOf(row)
+				// 有负责人 = 已分配并锁定（派发守卫会阻止他人再派）；没有 = 待认领。
+				const ownerName = text(row.ownerName)
+				const locked = ownerName !== ''
+				const ownerChip = (key) => el('span', { className: 'cbv-chip', key }, locked ? '负责人 ' + ownerName : '待认领')
+				const lockChip = (key) => el('span', { className: 'cbv-chip', key, 'data-tt-locked': locked ? 'true' : 'false' }, locked ? '已锁定' : '未锁定')
+				const kids = [
+					// 折叠卡：任务编号 + 处理成员（弹窗里这两格已在 facts-top，不重复印）。
+					isOpen
+						? null
+						: el(
+							'div',
+							{ className: 'cbv-card-top', key: 'head' },
+							el('span', { className: 'cbv-id', key: 'id' }, id === '' ? '(无编号)' : id),
+							ownerChip('owner'),
+							lockChip('lock'),
+						),
+					// 标签：交接（谁 → 谁 / 谁派发）、冲突任务编号、原生状态与截断提示。
+					isOpen || (pendingState === null && handoff === undefined && conflicts.length === 0 && truncations.length === 0)
+						? null
+						: el(
+							'div',
+							{ className: 'cbv-card-top', key: 'tags' },
+							pendingState,
+							handoff === undefined
+								? null
+								: el(
+									'span',
+									{ className: 'cbv-chip', key: 'handoff', 'data-tt-handoff': text(handoff.task) },
+									text(handoff.to) === '' ? '派发 ' + text(handoff.from) : text(handoff.from) + ' → ' + text(handoff.to),
+								),
+							conflicts.map((other) => el('span', { className: 'cbv-chip cbv-chip--p1', key: 'cf-' + other, 'data-tt-conflict': other }, '冲突 ' + other)),
+							truncations.map((item, at) =>
+								el('span', { className: 'cbv-chip cbv-chip--exception', key: 'tr' + at, 'data-tt-truncated': text(item.field) }, '截断 ' + text(item.field)),
+							),
+						),
+					el('div', { className: 'cbv-desc' + (isOpen ? '' : ' cbv-clamp-2'), key: 'subject' }, subject === '' ? '（没有主题）' : subject),
+					description === '' || descriptionIsDuplicate || isOpen ? null : el('div', { className: 'cbv-sub cbv-clamp-2', key: 'desc' }, description),
+				]
+				// 浮窗只补"卡上还没有的东西"：不印原生字段名与系统坐标（`status：` / `revision：` /
+				// `ownerName：` / `ready：` / `blockedBy：` / `writeScopes：`），那些卡上已用中文说了一次。
+				if (isOpen) {
+					const facts = [
+						el(
+							'div',
+							{ className: 'cbv-card-top', key: 'facts-top' },
+							el('span', { className: 'cbv-id', key: 'id' }, id === '' ? '(无编号)' : id),
+							ownerChip('owner'),
+							lockChip('lock'),
+							pendingState,
+							el('span', { className: 'cbv-chip', key: 'rev' }, 'v' + text(row.revision)),
+						),
+					]
+					if (description !== '' && !descriptionIsDuplicate) facts.push(mdField('cbv-block', description, '', 'description'))
+					if (blockedBy.length > 0) facts.push(mdField('cbv-block', '依赖 ' + blockedBy.join('、'), '', 'blocked'))
+					if (blockedNow) {
+						// 「有依赖」是事实（上一行照印，完成也在）；这一行只回答"被谁卡着"。
+						const unmet = blockedBy.filter((id) => taskStatusById.get(typeof id === 'string' ? id : String(id ?? '')) !== 'completed')
+						facts.push(mdField('cbv-block', '被阻塞：' + (unmet.length === 0 ? '依赖未完成' : unmet.join('、') + ' 未完成'), '', 'blocked-now'))
+					}
+					if (scopes.length > 0) facts.push(mdField('cbv-block', '写盘面 ' + scopes.join('、'), '', 'scopes'))
+					if (status === 'completed' && row.checkpoint !== null && typeof row.checkpoint === 'object') {
+						facts.push(mdField('cbv-block', row.checkpoint.present === true ? '检查点：有' : row.checkpoint.present === null ? '检查点：读不到（读不到 ≠ 没有）' : '检查点：无（收口前补一份）', '', 'checkpoint'))
+					}
+					if (scopeWarnings.length > 0) facts.push(mdField('cbv-block', scopeWarnings.map((line) => '- ' + line).join('\n'), '', 'scope-warnings'))
+					for (const [at, item] of truncations.entries()) {
+						facts.push(mdField('cbv-block', `只列了前 ${text(item.shown)} 条（共 ${text(item.total)} 条）：原生把 \`${text(item.field)}\` 按条数截到 ${text(item.limit)} 条 —— 字段的判据仍按**全部**条目算。`, '', 'trunc' + at))
+					}
+					kids.push(el('div', { className: 'cbv-detail', key: 'detail' }, facts))
+				}
+				return el(
+					'div',
+					{
+						...CARD_SHELL_PROPS('tt' + index + '#' + id, onToggle),
+						'data-tt-id': id,
+						'data-tt-status': status,
+						'data-tt-ready': row.ready === true ? 'true' : 'false',
+						'data-tt-owner': text(row.ownerName),
+					},
+					kids,
+				)
+			}
+
+			// 浮窗栏内翻页：先认出条目属于哪一栏、只在该栏内翻（跨栏不翻）；用 `visibleRows`，被筛掉的行不进翻页池。
+			const orderedItems = []
+			if (detail !== null) {
+				for (const column of TEAM_TASK_COLUMNS) {
+					const inColumn = visibleRows.filter((row) => text(row.status) === column.key)
+					if (inColumn.some((row) => text(row.id) === detail.id)) {
+						orderedItems.push(...inColumn)
+						break
+					}
+				}
+			}
+			const detailIndex = detail === null ? -1 : orderedItems.findIndex((row) => text(row.id) === detail.id)
+			navRef.current = { ordered: orderedItems, index: detailIndex }
+			const step = (offset) => {
+				const current = navRef.current
+				const at = current.index + offset
+				if (at < 0 || at >= current.ordered.length) return
+				setDetail({ id: text(current.ordered[at].id) })
+			}
+			/**
+			 * **切换分栏**（← → 用的那一步）：从当前项所在栏往 `offset` 方向走，遇到空栏跳过，
+			 * 落在那一栏里**同一个位置**（不够就落在它最后一个）；到底了就不动。
+			 * 判据与 `orderedItems` 同一份数据（`TEAM_TASK_COLUMNS` + `visibleRows`），不另算一套。
+			 */
+			const columnStep = (offset) => {
+				const at = TEAM_TASK_COLUMNS.findIndex((column) => visibleRows.some((row) => text(row.id) === detail.id && text(row.status) === column.key))
+				if (at < 0) return
+				const mineAt = visibleRows.filter((row) => text(row.status) === TEAM_TASK_COLUMNS[at].key).findIndex((row) => text(row.id) === detail.id)
+				for (let i = at + offset; i >= 0 && i < TEAM_TASK_COLUMNS.length; i += offset) {
+					const list = visibleRows.filter((row) => text(row.status) === TEAM_TASK_COLUMNS[i].key)
+					if (list.length === 0) continue
+					const target = list[Math.min(Math.max(mineAt, 0), list.length - 1)]
+					setDetail({ id: text(target.id) })
+					return
+				}
+			}
+			const detailRow = detailIndex < 0 ? null : orderedItems[detailIndex]
+			const overlay =
+				detailRow === null || detailRow === undefined
+					? null
+					: teamTaskOverlayOf(detailRow, orderedItems, detailIndex, step, () => setDetail(null), modalRef, labelOfColumn(TEAM_TASK_COLUMNS, detailRow, 'status'))
+
+			// **可用但为空**、**筛选落空**、**读不到**是三件不同的事，各说各的；读不到还要给一枚「重读」
+			//（宿主刚起来时它可恢复 —— 恢复动作不该只藏在窗口 focus 事件里）。
+			const teamEmpty = teamAvailable && teamRows.length === 0
+			const filteredOut = teamAvailable && teamRows.length > 0 && visibleRows.length === 0
+			// 三栏骨架（每栏 2 张，设计 5.3）：加载中不再换成一整行文本，栏头与栏位先在，结构不跳。
+			const boardSkeleton = el(
+				'div',
+				{ className: 'cbv-board', key: 'boardSkeleton', 'data-skeleton': 'board', 'aria-hidden': 'true' },
+				TEAM_TASK_COLUMNS.map((column) =>
+					el(
+						'div',
+						{ className: 'cbv-col', key: column.key },
+						el('div', { className: 'cbv-col-head', key: 'head' }, el('span', { className: 'cbv-skel-line cbv-skel-line--title', key: 'title' })),
+						el('div', { className: 'cbv-col-body', key: 'body' }, skeletonCardsOf(2)),
+					),
+				),
+			)
+			const boardState = teamAvailable ? (teamEmpty ? 'empty' : filteredOut ? 'filtered' : teamWarnings.length > 0 || teamTruncations.length > 0 || team.stale === true ? 'degraded' : 'ok') : 'degraded'
+			const teamBoard = [
+				team.phase === 'loading'
+					? el(
+							'div',
+							{ className: 'cbv-skel-block', key: 'teamLoading', 'data-team-phase': 'loading', 'aria-busy': 'true' },
+							el('span', { className: 'cbv-sr-only', key: 'say' }, '正在读取本会话的团队任务板…'),
+							showSkeleton ? boardSkeleton : null,
+						)
+					: teamAvailable
+						? teamEmpty
+							? el(
+									'div',
+									{ className: 'cbv-pane-empty cbv-md', key: 'teamEmpty', 'data-team-phase': 'ready' },
+									markdownNodes('本会话还没有原生任务。', 'team-empty'),
+								)
+							: filteredOut
+								? el(
+										'div',
+										{ className: 'cbv-pane-empty cbv-pane-empty--filters', key: 'ttNoFilter', 'data-team-phase': 'ready' },
+										el('span', { key: 'word' }, `没有匹配的条目（本会话共 ${teamRows.length} 条）。`),
+										el('button', { className: 'cbv-btn', key: 'clear', type: 'button', 'data-filters-clear': 'board', onClick: clearFilters }, '清除筛选'),
+									)
+								: el('div', { className: 'cbv-board', key: 'board', 'data-team-board': 'true' }, TEAM_TASK_COLUMNS.map((column) => columnOf(column)))
+						: el(
+								'div',
+								{ className: 'cbv-pane-empty', key: 'noTeam', 'data-team-phase': team.phase },
+								teamReason === '' ? '读不到本会话的团队任务板。' : teamReason,
+								el('button', { className: 'cbv-btn', key: 'retry', type: 'button', 'data-pane-retry': 'board', onClick: retry }, '重读'),
+							),
+
+				// 重取失败但手里有旧读数：保留内容 + 说清"这是上一次读数"（设计 3.3）。
+				team.stale === true
+					? el(
+							'div',
+							{ className: 'cbv-pane-warn cbv-md', key: 'stale' },
+							markdownNodes('显示的是上一次读数（这一次没读到最新的）。', 'tt-stale'),
+							el('button', { className: 'cbv-btn', key: 'stale-retry', type: 'button', 'data-stale-retry': 'board', onClick: retry }, '重读'),
+						)
+					: null,
+				// 原生给的那几行告警（写盘面重叠之类的原文）：它自己写的就是 markdown ⇒ 走渲染，标记不上屏。
+				...teamWarnings.map((line, index) => el('div', { className: 'cbv-pane-warn cbv-md', key: 'w' + index }, markdownNodes(line, 'tt-warn' + index))),
+				overlay,
+			]
+
+			// 人要求：看板块**不再印内页标题**（tab 栏上已经有「任务看板」了）。
+
+			// 最小筛选（分档 chip + 搜索）：任务过十条时，"先干哪条"要在这一屏看出来。
+			// 计数一律照 `TEAM_TASK_STAGES` 的判据算（与原生的 `ready` / `blockedBy` / `writeScopeWarnings` 同一份数据）。
+			const chips = el(
+				'span',
+				{ className: 'cbv-badges', key: 'chips' },
+				TEAM_TASK_STAGES.map((item) =>
+					el(
+						'button',
+						{
+							className: 'cbv-flt-chip' + (item.key === stageSpec.key ? ' cbv-flt-chip--on' : ''),
+							key: item.key,
+							type: 'button',
+							'aria-pressed': item.key === stageSpec.key ? 'true' : 'false',
+							'data-tt-stage': item.key,
+							onClick: () => setStage(item.key),
+						},
+						item.label + ' ' + stageCount(item),
+					),
+				),
+			)
+			// 这几枚同样是**筛选条件，不是划分**（一条任务可以既"可认领"又"写盘面重叠"）。
+			const toolbar = el(
+				'div',
+				{ className: 'cbv-flt-bar', key: 'team-bar' },
+				chips,
+				el('span', { className: 'cbv-spacer', key: 'spacer' }),
+				el('input', {
+					className: 'cbv-input cbv-flt-search',
+					key: 'query',
+					type: 'text',
+					value: query,
+					placeholder: '搜索：编号 / 主题 / 描述 / owner / 依赖 / 写盘面…',
+					'aria-label': '搜索本会话的团队任务',
+					onChange: (event) => setQuery(event.target.value),
+					onKeyDown: (event) => {
+						// Esc 清空搜索并保持焦点（设计 7.1）。
+						if (event !== null && event !== undefined && event.key === 'Escape') {
+							event.preventDefault()
+							setQuery('')
+						}
+					},
+				}),
+			)
+
+			return el(
+				'div',
+				{
+					className: 'cbv-view',
+					key: 'board-block',
+					ref: null,
+					'data-board-picked': source,
+					'data-board-mark': PANE_MARK,
+					// 统一状态标记（设计 5.4）：`data-board-phase/state` 是正名，`data-team-phase` 再留一个版本。
+					'data-board-phase': team.phase,
+					'data-board-state': boardState,
+					'data-team-phase': team.phase,
+					'data-board-total': '' + teamRows.length,
+					'data-board-visible': '' + visibleRows.length,
+				},
+				toolbar,
+				...teamBoard,
+			)
+		}
+
+		/**
+		 * **默认队友清单**那一节：角色 + 每个角色现在的编制状态（只读）。
+		 *
+		 * 数据来自端点载荷的 `defaults`（宿主调的是引擎 `defaultRosterOf` / `defaultRosterView` ——
+		 * 与会话工具 `member_defaults` **同一个函数**），所以面板上印的清单与工具回执逐条一样。
+		 * **这一节只管两件事**：把名册印出来（清单 + 编制状态）、以及在卡上增删改角色定义。
+		 * **"叫人干活"不在这里**：那是**输入框工具行那一枚「角色」按钮**的事（人的更正：「我的意思是在
+		 * 输入框添加一个「角色」按钮，不是让你写在「成员」里面」）—— 见 `RoleComposerEntry`。
+		 * @param data - 成员端点载荷。
+		 * @returns 一节节点；载荷没有这一格时返回 null（老版本宿主）。
+		 */
+		const rosterSectionOf = (data, actions) => {
+			const block = data === null || data.defaults === undefined || data.defaults === null ? null : data.defaults
+			const act = actions === undefined || actions === null ? {} : actions
+			// **没有 `defaults` 这一格**（老宿主）才整节不渲染；`rows` 为空是「角色目录里还没有角色」
+			// —— 那是**空态**，要连「＋ 添加角色」一起给（设计 P-07 / 4.2.4）。
+			if (block === null || !Array.isArray(block.rows)) return null
+			const hiddenRows = Array.isArray(block.hiddenRows) ? block.hiddenRows : []
+			// **来源筛档**（task-38）：档位与中文标签都来自载荷（`originFacets`，服务端那一处正文）——
+			// 前端**不硬编码**任何"哪个 origin 该显示什么"的判断，只按 key 过滤。
+			const originFacets = Array.isArray(block.originFacets) ? block.originFacets : []
+			// **导出前置条件**（设计 P-12）：没有任何 `origin !== 'package'` 的角色时不发请求。
+			const customCount = block.rows.filter((row) => text(row.origin) !== 'package').length
+			const exportDisabled = customCount === 0
+			// 档位从调用方传进来（`rosterSectionOf` 与 `RolesView` 是两个作用域，别直接读那边的 state）。
+			const originFacet = text(act.rosterOriginFacet) === '' ? 'all' : text(act.rosterOriginFacet)
+			const shownRows = originFacet === 'all' ? block.rows : block.rows.filter((row) => text(row.origin) === originFacet)
+			// **这一节不印任何汇总读数**（人的口径：面板上的统计性描述都去掉）：上面那排筛选 chip 写着真数，
+			// 每张角色卡自己带着编制状态；要机器核对看 `data-roster-count`（数据属性，不是给人读的一行字）。
+			return el(
+				'div',
+				{ className: 'cbv-roster', key: 'roster', 'data-roster-count': '' + block.rows.length, 'data-roster-visible': '' + shownRows.length, 'data-roster-hidden': '' + hiddenRows.length, 'data-roster-established': block.established === true ? 'true' : 'false' },
+				el(
+					'div',
+					{ className: 'cbv-view-head', key: 'roster-head' },
+					// 人要求：这一节不再印「角色」标题 —— tab 栏上已经有「角色」了，这里只留筛选与动作。
+
+					// **来源筛选：下拉**（人的口径：**除成员页外，其它筛选行都退回下拉**）——档位来自载荷
+					// `originFacets`；一档都不显示时不画（省得占地方）。单选的语义与从前的 chip 排**一样**。
+					originFacets.length <= 1
+						? null
+						: el(
+								'select',
+								{
+									className: 'cbv-select cbv-flt-select',
+									key: 'origin-facet',
+									'data-roster-origin-facet': '',
+									'aria-label': '按来源筛选',
+									value: originFacet,
+									onChange: (event) => act.setRosterOriginFacet(event.target.value),
+								},
+								el('option', { value: 'all', key: 'all' }, `全部来源（${block.rows.length}）`),
+								originFacets.map((facet) => el('option', { value: facet.key, key: facet.key, 'data-roster-origin-option': facet.key }, `${text(facet.label)}（${facet.count}）`)),
+							),
+					el('span', { className: 'cbv-spacer', key: 'roster-spacer' }),
+					// **角色包**：导出把当前自建角色打成一个文件带走；导入先预览再落盘（判定全在宿主）。
+					// 两个动作都不影响包内角色 —— 那一份是发布面，随插件升级整份替换。
+					el(
+						'button',
+						{
+							className: 'cbv-btn',
+							key: 'roster-export',
+							type: 'button',
+							'data-roster-action': 'export',
+							// 前置禁用：没有自建角色时点了也只会收到 409（设计 P-12 / A-16）。
+							'aria-disabled': exportDisabled ? 'true' : undefined,
+							onClick: () => {
+								if (exportDisabled) {
+									// 不发请求，只把原因说清（与按钮下方那句同一句话）。
+									if (typeof act.showNote === 'function') act.showNote('没有可导出的自建角色（包内角色不随包走）。')
+									return
+								}
+								act.exportRoles()
+							},
+						},
+						'导出',
+					),
+					el('button', { className: 'cbv-btn', key: 'roster-import', type: 'button', 'data-roster-action': 'import', onClick: () => act.importRoles() }, '导入'),
+					// **添加**：新角色写在用户角色根（`$DSH_HOME/team-ops/roles/<id>/ROLE.md`）——
+					// 那是"你自己的角色"，包内那份不受影响、升级也不会被刷掉。
+					el('button', { className: 'cbv-btn', key: 'roster-add', type: 'button', 'data-roster-action': 'add', onClick: () => act.openRosterDialog({ kind: 'create' }) }, '＋ 添加角色'),
+				),
+				// 回执紧贴工具行下方（设计 P-14）；成功 `role=status`、失败 `role=alert`。
+				act.notice === undefined || act.notice === null ? null : act.notice,
+				exportDisabled
+					? el(
+							'div',
+							{ className: 'cbv-pane-note', key: 'roster-export-hint', 'data-roles-export-hint': '' },
+							'没有可导出的自建角色（包内角色不随包走）。',
+						)
+					: null,
+				// 空态：**不是**「这一版宿主没有返回角色目录」（那是 `roster === null` 那一支）。
+				block.rows.length === 0
+					? el(
+							'div',
+							{ className: 'cbv-pane-empty', key: 'roster-empty', 'data-roles-empty': '' },
+							'角色目录里还没有角色。',
+							el('button', { className: 'cbv-btn', key: 'add-empty', type: 'button', 'data-roster-action': 'add-empty', onClick: () => act.openRosterDialog({ kind: 'create' }) }, '＋ 添加角色'),
+						)
+					: shownRows.length === 0
+						? // 筛空（设计 5.2：来源筛选落空 +「清除筛选」）——与"目录真的空"分开说。
+							el(
+								'div',
+								{ className: 'cbv-pane-empty cbv-pane-empty--filters', key: 'roster-filtered', 'data-roles-filtered': '' },
+								el('span', { key: 'word' }, `没有匹配的条目（共 ${block.rows.length} 条）。`),
+								el('button', { className: 'cbv-btn', key: 'clear', type: 'button', 'data-filters-clear': 'roles', onClick: () => act.setRosterOriginFacet('all') }, '清除筛选'),
+							)
+						: el(
+					'div',
+					{ className: 'cbv-roster-grid', key: 'roster-grid' },
+					shownRows.map((row, index) =>
+						el(
+							'div',
+							{
+								className: 'cbv-box cbv-roster-card',
+								key: 'r' + index,
+								'data-roster-role': text(row.role),
+								'data-roster-state': text(row.state),
+								'data-roster-next': text(row.nextName),
+								// **来源标**（来自载荷 `originLabel`；服务端那张表是唯一的词源）
+								'data-roster-origin': text(row.origin),
+								'data-roster-origin-label': text(row.originLabel),
+							},
+							el(
+								'div',
+								{ className: 'cbv-mp-top', key: 'top' },
+								// 头像框与成员卡同款（同一套 `.cbv-mp-avatar` + 引擎给的色调档）：清单里每一条
+								// 也是"一个人"，没有头像框时这一栏看着像设置项，不像"可叫的人"。
+								el(
+									'span',
+									{
+										className: 'cbv-mp-avatar cbv-mp-avatar--' + (text(row.avatarTone) === '' ? 'exec' : text(row.avatarTone)),
+										key: 'av',
+										'data-roster-avatar': text(row.role),
+										'aria-hidden': 'true',
+									},
+									avatarIconOf(row.avatar),
+								),
+								el(
+									'div',
+									{ className: 'cbv-mp-nameblock', key: 'namebox' },
+									el('span', { className: 'cbv-id', key: 'role' }, text(row.role)),
+									el(
+										'div',
+										{ className: 'cbv-badges', key: 'chips' },
+										el('span', { className: 'cbv-chip', key: 'title' }, text(row.title)),
+										text(row.category) === '' ? null : el('span', { className: 'cbv-chip', key: 'cat' }, text(row.category)),
+										// **来源那一枚**：项目级 / 用户级 / 包内（`originLabel` 由服务端给）
+										text(row.originLabel) === '' ? null : el('span', { className: 'cbv-chip cbv-chip--origin', key: 'origin', 'data-roster-origin-chip': text(row.origin) }, text(row.originLabel)),
+									),
+								),
+							),
+							el('div', { className: 'cbv-desc', key: 'pos' }, text(row.positioning)),
+							// 状态行只在真有人时印（空档"未到场"印 18 遍不是信息）；`data-roster-state` 照旧在。
+							text(row.state) === 'vacant' ? null : el('div', { className: 'cbv-sub', key: 'state' }, text(row.label)),
+							// 动作名按出处说准：包内角色的两个动词是"改（写覆盖）"与"下架（可恢复）"，不是"删掉"；判据来自载荷的 `removal`。
+							el(
+								'div',
+								{ className: 'cbv-cardbar', key: 'bar' },
+								el('button', { className: 'cbv-cardbtn', key: 'edit', type: 'button', 'data-roster-action': 'edit', onClick: () => act.openRosterDialog({ kind: 'edit', entry: row }) }, '修改'),
+								// **导出这一个**：只打包这个角色（与它引用的自建技能），给"分享一个角色"用。
+								el('button', { className: 'cbv-cardbtn', key: 'export', type: 'button', 'data-roster-action': 'export-one', onClick: () => act.exportOneRole(row) }, '导出'),
+								el(
+									'button',
+									{ className: 'cbv-cardbtn', key: 'remove', type: 'button', 'data-roster-action': 'remove', 'data-roster-removal': text(row.removal), onClick: () => act.openRosterDialog({ kind: 'remove', entry: row }) },
+									text(row.removal) === 'hide' ? '下架' : text(row.removal) === 'revert' ? '还原为包内' : '删除',
+								),
+							),
+						),
+					),
+				),
+				block.established === true
+					? null
+					: el(
+							'div',
+							{ className: 'cbv-pane-note cbv-md', key: 'roster-unestablished' },
+							markdownNodes('名册文件还没建立 —— 一个人都还没叫过。', 'roster-unestablished'),
+						),
+				// 已下架的那些折一行（**可恢复**）：它们是包内角色，"删除"在这里的形态就是不上货架。
+				hiddenRows.length === 0
+					? null
+					: el(
+							'div',
+							{ className: 'cbv-pane-note', key: 'roster-hidden', 'data-roster-hidden-row': '' + hiddenRows.length },
+							'已下架（本工作区不上货架，可恢复）：',
+							...hiddenRows.map((row, index) => [
+								index === 0 ? null : '、',
+								el('button', { className: 'cbv-cardbtn', key: 'h' + index, type: 'button', 'data-roster-action': 'restore', onClick: () => act.restoreRole(row) }, `恢复 ${text(row.role)}`),
+							]),
+						),
+				// 收尾的"怎么叫人 / 名字怎么取 / 状态怎么变"不再印在面板上（描述性文字太多）。
+				null,
+			)
+		}
+
+		/** 我们这一套 `@` 来源的稳定 id（引用对象的 `source` 必须与它逐字相等）。 */

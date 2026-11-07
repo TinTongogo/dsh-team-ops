@@ -1,0 +1,666 @@
+		// ── ⑰ 输入框润色 ─────────────────────────────────────────────────────
+		// **本片段排在 ⑯ 之后，而 ⑯ 末尾已经 `return exports`** —— 所以这一片里**只能出现函数声明**：
+		// function 声明在函数体入口就被提升（可以放心被 ⑯ 的 `apply` 引用），而 `const` / `let`
+		// 的初始化语句在 `return` 之后永远不执行，写成 const 会在渲染时抛 TDZ。
+		// 新增常量请放进函数体内；`tests/panel-blocks.test.mjs` 钉着"这一片不许有顶层 const/let"。
+
+		/** 润色草稿的字数上限（与服务端契约同一条；**不截断**——截断会丢意图）。 */
+		function polishMaxChars() {
+			return 4000
+		}
+
+		/**
+		 * 一枚内联 SVG（描边、`currentColor`；与 ⑦ 的头像同一套几何风格）。**不用 emoji。**
+		 * @returns 节点。
+		 */
+		function polishIconOf() {
+			return el(
+				'svg',
+				{
+					className: 'cbv-polish-icon',
+					viewBox: '0 0 24 24',
+					width: '16',
+					height: '16',
+					fill: 'none',
+					stroke: 'currentColor',
+					strokeWidth: '1.8',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+					'aria-hidden': 'true',
+					focusable: 'false',
+					'data-polish-icon': '',
+				},
+				// 一颗四角星 + 一颗小星：语义是"打磨一下措辞"，不是"魔法棒"那种夸张图形。
+				el('path', { key: 'star', d: 'M12 3.2l1.9 4.9 4.9 1.9-4.9 1.9L12 16.8l-1.9-4.9L5.2 10l4.9-1.9z' }),
+				el('path', { key: 'spark', d: 'M18.4 15.1l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8z' }),
+			)
+		}
+
+		/**
+		 * 字数：按**码点**数（中文一个字算 1，不按 UTF-16 长度算成 2）。
+		 * @param value - 文本。
+		 * @returns 字数。
+		 */
+		function polishCharsOf(value) {
+			let count = 0
+			for (const unused of text(value)) count += 1
+			return count
+		}
+
+		/**
+		 * 把一段文本切成可拼回原文的 token：中文按字、英文/数字/标识符按连续段、空白与标点各自成段。
+		 * 分词只服务 diff 的**粒度**；每个 token 原样拼回去逐字等于原文（行尾空格不会丢）。
+		 * @param value - 原文或结果。
+		 * @returns token 数组。
+		 */
+		function polishTokensOf(value) {
+			const WORD = /[A-Za-z0-9_@#%&+*=/\\:.-]/
+			const CJK = /[\u3400-\u4dbf\u4e00-\u9fff]/
+			const SPACE = /\s/
+			const out = []
+			let buffer = ''
+			let kind = ''
+			const flush = () => {
+				if (buffer !== '') {
+					out.push(buffer)
+					buffer = ''
+					kind = ''
+				}
+			}
+			for (const ch of text(value)) {
+				let next
+				if (CJK.test(ch)) next = 'cjk'
+				else if (WORD.test(ch)) next = 'word'
+				else if (SPACE.test(ch)) next = 'space'
+				else next = 'punct'
+				if (next === 'cjk') {
+					flush()
+					out.push(ch)
+					continue
+				}
+				if (next !== kind) {
+					flush()
+					kind = next
+				}
+				buffer += ch
+			}
+			flush()
+			return out
+		}
+
+		/**
+		 * 词级 diff 的编辑脚本。先剥掉公共前后缀（润色通常只动几处，这一步把中间段压到很小），
+		 * 再做 LCS；中间段过大时不做 O(n·m)（4000 字上限下极端仍是千万格），整段按"删除 + 新增"呈现
+		 * —— 视觉上仍说清"这片改了"，不假装精确。
+		 * @param left - 原文 token 的中间段。
+		 * @param right - 结果 token 的中间段。
+		 * @returns `[{ kind: 'same'|'del'|'add', text }]`。
+		 */
+		function polishDiffOpsOf(left, right) {
+			const n = left.length
+			const m = right.length
+			if (n * m > 120000) {
+				const ops = []
+				for (const token of left) ops.push({ kind: 'del', text: token })
+				for (const token of right) ops.push({ kind: 'add', text: token })
+				return ops
+			}
+			const width = m + 1
+			const table = new Uint32Array((n + 1) * width)
+			for (let i = n - 1; i >= 0; i -= 1) {
+				for (let j = m - 1; j >= 0; j -= 1) {
+					table[i * width + j] = left[i] === right[j] ? table[(i + 1) * width + j + 1] + 1 : Math.max(table[(i + 1) * width + j], table[i * width + j + 1])
+				}
+			}
+			const ops = []
+			let i = 0
+			let j = 0
+			while (i < n && j < m) {
+				if (left[i] === right[j]) {
+					ops.push({ kind: 'same', text: left[i] })
+					i += 1
+					j += 1
+				} else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) {
+					ops.push({ kind: 'del', text: left[i] })
+					i += 1
+				} else {
+					ops.push({ kind: 'add', text: right[j] })
+					j += 1
+				}
+			}
+			while (i < n) {
+				ops.push({ kind: 'del', text: left[i] })
+				i += 1
+			}
+			while (j < m) {
+				ops.push({ kind: 'add', text: right[j] })
+				j += 1
+			}
+			return ops
+		}
+
+		/** 把相邻同类的 token 并成一段（渲染时少一堆节点；拼回去仍逐字等于原文）。 */
+		function polishRunsOf(parts) {
+			const out = []
+			for (const part of parts) {
+				if (part.text === '') continue
+				const last = out[out.length - 1]
+				if (last !== undefined && last.kind === part.kind) last.text += part.text
+				else out.push({ text: part.text, kind: part.kind })
+			}
+			return out
+		}
+
+		/**
+		 * 本地词级 diff（**高亮以本地为准**：服务端 `changes` 只用于摘要行）。
+		 * @param before - 原文。
+		 * @param after - 润色结果。
+		 * @returns `{ before, after, changed }`：两个渲染段 + 是否有改动。
+		 */
+		function polishDiffOf(before, after) {
+			const left = polishTokensOf(before)
+			const right = polishTokensOf(after)
+			const beforeParts = []
+			const afterParts = []
+			let start = 0
+			while (start < left.length && start < right.length && left[start] === right[start]) start += 1
+			let endLeft = left.length
+			let endRight = right.length
+			while (endLeft > start && endRight > start && left[endLeft - 1] === right[endRight - 1]) {
+				endLeft -= 1
+				endRight -= 1
+			}
+			for (let i = 0; i < start; i += 1) {
+				beforeParts.push({ text: left[i], kind: 'same' })
+				afterParts.push({ text: left[i], kind: 'same' })
+			}
+			const ops = polishDiffOpsOf(left.slice(start, endLeft), right.slice(start, endRight))
+			for (const op of ops) {
+				if (op.kind === 'same') {
+					beforeParts.push({ text: op.text, kind: 'same' })
+					afterParts.push({ text: op.text, kind: 'same' })
+				} else if (op.kind === 'del') beforeParts.push({ text: op.text, kind: 'del' })
+				else afterParts.push({ text: op.text, kind: 'add' })
+			}
+			for (let i = endLeft; i < left.length; i += 1) {
+				beforeParts.push({ text: left[i], kind: 'same' })
+				afterParts.push({ text: left[i], kind: 'same' })
+			}
+			const beforeRuns = polishRunsOf(beforeParts)
+			const afterRuns = polishRunsOf(afterParts)
+			return {
+				before: beforeRuns,
+				after: afterRuns,
+				changed: beforeRuns.some((run) => run.kind === 'del') || afterRuns.some((run) => run.kind === 'add'),
+			}
+		}
+
+		/**
+		 * 摘要行：**只显示类别与数量**（服务端 `changes` 归类；没有就退回本地 diff 的处数）。
+		 * @param payload - 200 载荷。
+		 * @param diff - 本地 diff。
+		 * @returns 一行文案（空串 = 不印）。
+		 */
+		function polishSummaryOf(payload, diff) {
+			const changes = payload !== null && payload !== undefined && Array.isArray(payload.changes) ? payload.changes : []
+			if (changes.length > 0) {
+				const order = []
+				const counts = new Map()
+				for (const change of changes) {
+					const raw = change !== null && change !== undefined && typeof change === 'object' ? text(change.kind) : ''
+					const kind = raw === '' ? '用词' : raw
+					if (!counts.has(kind)) {
+						counts.set(kind, 0)
+						order.push(kind)
+					}
+					counts.set(kind, counts.get(kind) + 1)
+				}
+				return '改动：' + order.map((kind) => kind + ' ' + counts.get(kind)).join(' · ')
+			}
+			const changed = diff === null || diff === undefined ? 0 : diff.before.filter((run) => run.kind === 'del').length
+			return changed === 0 ? '' : '改动：' + changed + ' 处'
+		}
+
+		/**
+		 * 失败原因 → 一句人话（设计 §7 的最终措辞；`error` 原文永远照印，这一句只是补"为什么 / 下一步"）。
+		 * @param reason - 载荷里的 `reason`。
+		 * @returns 一句说明；认不出返回空串。
+		 */
+		function polishReasonWordOf(reason) {
+			const key = text(reason)
+			if (key === 'no-route') return '本会话还没有可用的模型路由：先发一条消息，或在本插件配置里指定 provider / model。'
+			if (key === 'timeout') return '润色超时了（模型在时限内没回完），可以重试一次。'
+			if (key === 'rate-limited') return '润色太频繁了：每分钟最多 6 次，等一会儿再试。'
+			if (key === 'busy') return '同一会话同时只跑一个润色：上一轮还没结束。'
+			if (key === 'bad-request') return '请求不合法：草稿可能为空、超长或会话不对。'
+			if (key === 'upstream') return '上游模型报错，稍后重试。'
+			return ''
+		}
+
+		/**
+		 * 一段差异渲染：`same` 原样、`del` 删除线 + 红底、`add` 绿底；
+		 * 删除 / 新增各自带 `aria-label`（不只靠颜色传达，设计 §4 无障碍）。
+		 * @param runs - `[{ text, kind }]`。
+		 * @param role - `source` / `result`（也用作 data 属性）。
+		 * @param label - 这一段的 `aria-label`（原文（只读）/ 润色后）。
+		 * @returns 节点。
+		 */
+		function polishTextOf(runs, role, label) {
+			const children = []
+			runs.forEach((run, index) => {
+				if (run.kind === 'same') {
+					children.push(run.text)
+					return
+				}
+				const tag = run.kind === 'del' ? 'del' : 'ins'
+				children.push(
+					el(
+						tag,
+						{
+							// 色相复用既有**标签类**（删除=已打回红 / 新增=已完成绿）：portal 不在 `.cbv-root` 作用域里，
+						// 又不能让"强调只给标签"的口径破掉 —— 这两个类只提供底 / 描边 / 字重，不改布局。
+						className: 'cbv-polish-mark cbv-polish-mark--' + run.kind + (run.kind === 'del' ? ' cbv-chip--st-rejected' : ' cbv-chip--st-done'),
+							key: role + '-' + index,
+							'data-polish-mark': run.kind,
+							'aria-label': (run.kind === 'del' ? '删除：' : '新增：') + run.text,
+						},
+						run.text,
+					),
+				)
+			})
+			return el(
+				'div',
+				{ className: 'cbv-polish-text cbv-polish-text--' + role, key: role, tabIndex: 0, 'data-polish-text': role, 'aria-label': label },
+				children.length === 0 ? (role === 'source' ? '（草稿是空的）' : '（结果为空）') : children,
+			)
+		}
+
+		/**
+		 * 输入框右侧那一枚「润色」按钮 + 对比浮窗（design-polish-001 的 P0）。
+		 *
+		 * 三件不肯猜的事：
+		 *   · **草稿是标准 prop**（`useInput`）⇒ 覆盖走 `inputActions.setDraft`，与本体同一处；
+		 *   · **含 @ 引用就拒绝**（引用 chip 是结构化对象，整份覆盖会拍平）——判据来自会话作用域的
+		 *     `conversation` 把手（`composerAccessOf` 的 `occurrences`），不靠正则猜文本；
+		 *   · **采纳只在人点第二次（若草稿已变）之后发生**，浮窗失败不自动关、重试只发一次请求。
+		 * @param props - 席位标准 props（`useInput` / `inputActions` / `sessionId`）+ 外部塞进来的 `sessions`。
+		 * @returns 节点。
+		 */
+		function PolishEntry(props) {
+			const slotsProps = props === null || props === undefined ? {} : props
+			const sessionsService = slotsProps.sessions === undefined || slotsProps.sessions === null ? serviceOf('sessions') : slotsProps.sessions
+			const sessionId = typeof slotsProps.sessionId === 'string' ? slotsProps.sessionId : resolveCurrentSessionId()
+			const inputState = typeof slotsProps.useInput === 'function' ? slotsProps.useInput((state) => state) : null
+			const draft = inputState === null || inputState === undefined ? '' : text(inputState.draft)
+			const setDraft =
+				typeof slotsProps.inputActions === 'object' && slotsProps.inputActions !== null && typeof slotsProps.inputActions.setDraft === 'function'
+					? slotsProps.inputActions.setDraft
+					: null
+			const [open, setOpen] = React.useState(false)
+			// idle / requesting / ready / error —— 与设计 §2 的状态机同一套词。
+			const [phase, setPhase] = React.useState('idle')
+			const [payload, setPayload] = React.useState(null)
+			const [failure, setFailure] = React.useState({ error: '', reason: '' })
+			// **发起时的草稿**：采纳时要拿它判"草稿在请求期间有没有被改动"。
+			const [source, setSource] = React.useState('')
+			const [hint, setHint] = React.useState('')
+			const [hintTone, setHintTone] = React.useState('error')
+			// 二次确认：`armed` 为真时按钮写「仍要覆盖？」，两次点击才真的覆盖。
+			const [armed, setArmed] = React.useState(false)
+			const [copied, setCopied] = React.useState('')
+			const requestNo = React.useRef(0)
+			const abortRef = React.useRef(null)
+			const busyRef = React.useRef(false)
+			const buttonRef = React.useRef(null)
+			const sessionRef = React.useRef(sessionId)
+			const modalRef = useModalA11y(open, () => polishClose())
+
+			// **提示条要自己消失**（现场：点一下空草稿，提示一直挂在那儿还挡住按钮）。
+			// 规则：2 秒后自动收起（人的口径：4 秒还是太久）—— 它只解释"刚才为什么没动"，
+			// 不是常驻状态（成功/失败的结果在浮窗里，不靠这条提示承载）。
+			React.useEffect(() => {
+				if (hint === '') return undefined
+				const timer = setTimeout(() => setHint(''), 2000)
+				return () => clearTimeout(timer)
+			}, [hint])
+			/** 取消在途请求（关浮窗 / 换会话 / 卸载都走它）。 */
+			function polishAbort() {
+				requestNo.current += 1
+				busyRef.current = false
+				const controller = abortRef.current
+				abortRef.current = null
+				if (controller !== null && controller !== undefined && typeof controller.abort === 'function') {
+					try {
+						controller.abort()
+					} catch {
+						/* 已经结束的请求再 abort 也不该抛 */
+					}
+				}
+			}
+
+			/**
+			 * 关浮窗：取消请求、清结果；`note` 给了就在按钮旁显示一句（成功采纳 / 失败原因）。
+			 * @param note - 可选的提示文案。
+			 */
+			function polishClose(note) {
+				polishAbort()
+				setOpen(false)
+				setPhase('idle')
+				setPayload(null)
+				setFailure({ error: '', reason: '' })
+				setArmed(false)
+				setCopied('')
+				if (typeof note === 'string' && note !== '') {
+					setHint(note)
+					setHintTone('ok')
+				}
+			}
+
+			/**
+			 * 点按钮前的**本地校验**（零请求的三条：空 / 超长 / 含引用）。
+			 * @returns 不通过时的原因；通过返回空串。
+			 */
+			function polishCheck() {
+				const chars = polishCharsOf(draft)
+				if (chars === 0) return '草稿是空的，先写点什么再润色。'
+				if (chars > polishMaxChars()) return '草稿 ' + chars + ' 字，超过 ' + polishMaxChars() + ' 字上限（截断会丢信息，所以拒绝）。'
+				const access = composerAccessOf(sessionsService, sessionId)
+				const handle = access !== null && access !== undefined && access.handle !== null && access.handle !== undefined ? access.handle : null
+				const snapshot = handle !== null && typeof handle.state?.getSnapshot === 'function' ? handle.state.getSnapshot() : null
+				const occurrences = snapshot !== null && snapshot !== undefined && Array.isArray(snapshot.occurrences) ? snapshot.occurrences : []
+				if (occurrences.length > 0) return '草稿里含 @ 引用，润色会覆盖成纯文本——先复制文本再润色，或去掉引用。'
+				return ''
+			}
+
+			/**
+			 * 发一次润色请求。`polishRun(source, { retry: true })` 是失败后的重试（同一文本重发，只发一次）。
+			 * @param textValue - 要润色的文本。
+			 * @param options - `{ retry }`。
+			 */
+			function polishRun(textValue, options) {
+				if (busyRef.current) return
+				const retrying = options !== undefined && options !== null && options.retry === true
+				if (!retrying) {
+					const why = polishCheck()
+					if (why !== '') {
+						setHint(why)
+						setHintTone('error')
+						return
+					}
+				}
+				if (typeof fetch !== 'function') {
+					setHint('当前环境没有 fetch')
+					setHintTone('error')
+					return
+				}
+				const textValueNow = text(textValue)
+				busyRef.current = true
+				const id = requestNo.current + 1
+				requestNo.current = id
+				setHint('')
+				setHintTone('error')
+				setSource(textValueNow)
+				setPayload(null)
+				setFailure({ error: '', reason: '' })
+				setArmed(false)
+				setCopied('')
+				setPhase('requesting')
+				setOpen(true)
+				const controller = typeof AbortController === 'function' ? new AbortController() : null
+				abortRef.current = controller
+				// 这一条 **不改任何一块读回的数据**（不落盘、不写账本、不进缓存）⇒ 没有可失效的东西；
+				// 面板那条"写动作附近必须 invalidatePanes"的扫描按 `POLISH_ENDPOINT` 认这一处豁免。
+				fetch(POLISH_ENDPOINT, {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ session: sessionId, text: textValueNow }),
+					...(controller === null ? {} : { signal: controller.signal }),
+				})
+					.then((response) => response.json().then((data) => ({ response, data }), () => ({ response, data: null })))
+					.then(({ response, data }) => {
+						// 关窗 / 换会话之后迟到的响应一律丢弃（不让旧结果写回新状态）。
+						if (requestNo.current !== id) return
+						busyRef.current = false
+						abortRef.current = null
+						if (data !== null && data !== undefined && data.ok === true && typeof data.polished === 'string') {
+							setPayload(data)
+							setPhase('ready')
+							return
+						}
+						const error = data !== null && data !== undefined && typeof data.error === 'string' && data.error !== '' ? data.error : 'HTTP ' + response.status + '：润色没成功'
+						const reason = data !== null && data !== undefined && typeof data.reason === 'string' ? data.reason : ''
+						setFailure({ error, reason })
+						setPhase('error')
+					})
+					.catch((error) => {
+						if (requestNo.current !== id) return
+						busyRef.current = false
+						abortRef.current = null
+						const message = String(error !== null && error !== undefined && typeof error === 'object' && 'message' in error ? error.message : error)
+						// abort 是"人关掉了浮窗"，不是失败：不写错误态。
+						if (/abort/i.test(message)) return
+						setFailure({ error: '发不出去：' + message, reason: '' })
+						setPhase('error')
+					})
+			}
+
+			/** 采纳：草稿没变就直接覆盖；变了就先亮「仍要覆盖？」，第二次点击才执行。 */
+			function polishAdopt() {
+				if (payload === null || payload === undefined || typeof payload.polished !== 'string') return
+				if (draft !== source && armed !== true) {
+					setArmed(true)
+					return
+				}
+				if (setDraft === null) {
+					setHint('这个会话插不进输入框：自己复制润色后的文本。')
+					setHintTone('error')
+					return
+				}
+				try {
+					setDraft(payload.polished)
+				} catch (error) {
+					setHint('覆盖草稿失败：' + String(error !== null && error !== undefined && typeof error === 'object' && 'message' in error ? error.message : error))
+					setHintTone('error')
+					return
+				}
+				// 人的口径（HD-014）：采纳就是**直接替换输入框文字**，不再弹「已采纳」提示条。
+				polishClose()
+			}
+
+			/**
+			 * 复制一段文本（原文那枚按钮用）：成功 / 失败都如实说。
+			 * @param value - 要复制的文本。
+			 */
+			function polishCopy(value) {
+				void copyText(value).then((result) => {
+					if (result !== null && result !== undefined && result.ok === true) {
+						setCopied('已复制原文。')
+						return
+					}
+					const reason = result !== null && result !== undefined && typeof result.reason === 'string' && result.reason !== '' ? result.reason : '这个环境不允许剪贴板写入'
+					setCopied('复制失败：' + reason)
+				})
+			}
+
+			// 换会话：在途请求 abort、浮窗关闭（设计 §2.9）。故意不依赖 `sessionId` 的首次渲染。
+			React.useEffect(() => {
+				if (sessionRef.current === sessionId) return
+				sessionRef.current = sessionId
+				polishAbort()
+				setOpen(false)
+				setPhase('idle')
+				setPayload(null)
+				setFailure({ error: '', reason: '' })
+			}, [sessionId])
+			// 卸载：abort（组件被摘掉之后迟到的响应没有意义）。
+			React.useEffect(() => () => polishAbort(), [])
+
+			const chars = polishCharsOf(draft)
+			const empty = chars === 0
+			// 超长也**视觉上置灰**（不弹提示条）：点了没反应会让人以为坏了，所以先把「不可用」画出来。
+			const tooLong = chars > polishMaxChars()
+			const requesting = phase === 'requesting' && open
+			const hintId = 'cbv-polish-hint'
+
+			/** 对比浮窗本体（portal 到 `document.body`：composer 那片 `will-change` 会给 fixed 造包含块）。 */
+			function polishOverlayOf() {
+				const ready = phase === 'ready' && payload !== null && payload !== undefined
+				const polished = ready ? text(payload.polished) : ''
+				const diff = ready ? polishDiffOf(source, polished) : null
+				const scenario = ready ? text(payload.scenario) : ''
+				const language = ready ? text(payload.language) : ''
+				const subtitle = ready && scenario !== '' ? '识别：' + scenario + ' / ' + (language === '' ? '—' : language) : '识别：…'
+				const checks = ready && payload.checks !== null && payload.checks !== undefined && payload.checks.ok === false ? payload.checks : null
+				const findings = checks !== null && Array.isArray(checks.findings) ? checks.findings : []
+				const summary = ready ? polishSummaryOf(payload, diff) : ''
+				const sourceRuns = diff === null ? [{ text: source, kind: 'same' }] : diff.before
+				const resultRuns = diff === null ? [] : diff.after
+				const resultChars = ready ? polishCharsOf(polished) : 0
+				return el(
+					'div',
+					{ className: 'cbv-overlay cbv-polish-overlay', key: 'polish-overlay', onClick: () => polishClose() },
+					el(
+						'div',
+						{
+							className: 'cbv-modal cbv-polish-modal',
+							key: 'polish-modal',
+							role: 'dialog',
+							'aria-modal': 'true',
+							'aria-label': '润色',
+							ref: modalRef,
+							tabIndex: -1,
+							'data-polish-dialog': phase,
+							onClick: (event) => event.stopPropagation(),
+						},
+						el(
+							'div',
+							{ className: 'cbv-modal-head', key: 'head' },
+							el('span', { className: 'cbv-modal-title', key: 'title' }, '润色'),
+							el('span', { className: 'cbv-polish-sub', key: 'sub', 'data-polish-sub': '' }, subtitle),
+							el(
+								'div',
+								{ className: 'cbv-modal-actions', key: 'actions' },
+								el('button', { className: 'cbv-btn', key: 'copy', type: 'button', 'data-polish-copy': '', onClick: () => polishCopy(source) }, '复制原文'),
+								el('button', { className: 'cbv-btn', key: 'close', type: 'button', 'data-polish-close': '', onClick: () => polishClose() }, '关闭'),
+							),
+						),
+						el(
+							'div',
+							{ className: 'cbv-modal-body cbv-polish-body', key: 'body' },
+							copied === ''
+								? null
+								: el('div', { className: 'cbv-polish-copied', key: 'copied', role: 'status' }, copied),
+							checks === null
+								? null
+								: el(
+										'div',
+										{ className: 'cbv-polish-warn cbv-chip--st-verify', key: 'checks', role: 'status', 'data-polish-warn': '' },
+										el('div', { className: 'cbv-polish-warn-title', key: 'title' }, '机械校验提示（仍可采纳，请逐句确认）：'),
+										findings.map((line, index) => el('div', { className: 'cbv-polish-warn-line', key: 'finding-' + index }, text(line))),
+									),
+							el(
+								'div',
+								{ className: 'cbv-polish-section', key: 'source' },
+								el(
+									'div',
+									{ className: 'cbv-polish-label', key: 'label' },
+									'原文（只读）',
+									el('span', { className: 'cbv-polish-count', key: 'count' }, polishCharsOf(source) + ' 字'),
+								),
+								polishTextOf(sourceRuns, 'source', '原文（只读）'),
+							),
+							el(
+								'div',
+								{ className: 'cbv-polish-section', key: 'result' },
+								el(
+									'div',
+									{ className: 'cbv-polish-label', key: 'label' },
+									'润色后',
+									ready ? el('span', { className: 'cbv-polish-count', key: 'count' }, resultChars + ' 字') : null,
+								),
+								phase === 'requesting'
+									? el(
+											'div',
+											{ className: 'cbv-polish-loading', key: 'loading', 'aria-busy': 'true' },
+											el('span', { className: 'cbv-sr-only', key: 'say' }, '正在润色…'),
+											el('span', { className: 'cbv-polish-skel', key: 'line-1' }),
+											el('span', { className: 'cbv-polish-skel', key: 'line-2' }),
+											el('span', { className: 'cbv-polish-skel', key: 'line-3' }),
+											el('div', { className: 'cbv-polish-loading-word', key: 'word' }, '正在润色…'),
+										)
+									: phase === 'error'
+										? el(
+												'div',
+												{ className: 'cbv-polish-error cbv-chip--p0', key: 'error', role: 'alert', 'data-polish-error': '' },
+												el('div', { key: 'main' }, '润色失败：' + failure.error),
+												polishReasonWordOf(failure.reason) === ''
+													? null
+													: el('div', { className: 'cbv-polish-reason', key: 'reason' }, polishReasonWordOf(failure.reason)),
+											)
+										: ready
+											? polishTextOf(resultRuns, 'result', '润色后')
+											: null,
+							),
+							ready ? el('div', { className: 'cbv-polish-summary', key: 'summary', 'data-polish-summary': '' }, summary === '' ? '原文已经足够清晰，未做改动。' : summary) : null,
+						),
+						el(
+							'div',
+							{ className: 'cbv-polish-foot', key: 'foot' },
+							phase === 'error'
+								? el('button', { className: 'cbv-btn', key: 'retry', type: 'button', 'data-polish-retry': '', onClick: () => polishRun(source, { retry: true }) }, '重试')
+								: null,
+							el('button', { className: 'cbv-btn', key: 'cancel', type: 'button', 'data-polish-cancel': '', onClick: () => polishClose() }, '取消'),
+							el(
+								'button',
+								{
+									className: 'cbv-btn',
+									key: 'adopt',
+									type: 'button',
+									disabled: phase !== 'ready',
+									'data-polish-adopt': armed ? 'armed' : '',
+									onClick: polishAdopt,
+								},
+								armed ? '仍要覆盖？' : '采纳',
+							),
+						),
+					),
+				)
+			}
+
+			return el(
+				'div',
+				{ className: 'cbv-polish', key: 'polish' },
+				el(
+					'button',
+					{
+						key: 'polish-button',
+						ref: buttonRef,
+						className: 'cbv-composer-btn cbv-polish-btn' + (requesting ? ' cbv-polish-btn--busy' : ''),
+						type: 'button',
+						'aria-label': '润色草稿',
+						'aria-describedby': hint === '' ? undefined : hintId,
+						'aria-disabled': empty || tooLong ? 'true' : undefined,
+						disabled: requesting,
+						title: '润色草稿',
+						'data-polish-button': '',
+						onClick: () => {
+							if (requesting) return
+							// 人的口径（HD-014）：空草稿 / 超长**不响应** —— 不弹提示条、不发请求（按钮已置灰）。
+							if (empty || tooLong) return
+							polishRun(draft)
+						},
+					},
+					polishIconOf(),
+				),
+				// 人的口径（HD-014）：**不要视觉提示条**（多余）。拒绝原因只进**读屏**（`cbv-sr-only`），
+				// 视觉上点一下没反应就是「现在不能润色」；空草稿直接不响应（连读屏也不必播报）。
+				hint === ''
+					? null
+					: el('span', { key: 'hint', id: hintId, className: 'cbv-sr-only', role: 'status', 'data-polish-hint': hintTone }, hint),
+				open ? portalOf(polishOverlayOf()) : null,
+			)
+		}
+		// 工厂与模块注册的闭合括号（⑯ 的尾部让位给本节：⑰ 必须仍在工厂函数体内）。
+	},
+})

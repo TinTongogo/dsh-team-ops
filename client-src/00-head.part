@@ -1,0 +1,53 @@
+// dsh-team-ops · 一人公司文件前端页 —— browser half（client bundle）
+//
+// 由 dsh-client-modules 以 `/plugins/??dsh-team-ops/client.js&rev=…` 组合投递，
+// 在浏览器里经 cordis Loader 的 lazy-CJS 模块表执行：本文件是「调用
+// window.__ModuleLoader__.load 注册一个 CJS 工厂」的形态，与官方 ui-* 包以及
+// 第三方 dsh-dream-skin 的构建产物同一形状。工厂内只有平台种子词与已注册的
+// client bundle 可以被 require。
+//
+// 席位（**两个**）：① conversation.view —— 对话窗视图栏里「对话」「轨迹」之后的那一栏（四块）；
+//                  ② conversation.input.left —— 输入框工具行里那一枚「角色」按钮（选角色 ⇒ 让它去干）
+// （「团队状态」）。内里**四块**，块序 = **成员 / 角色 / 技能 / 任务看板**
+// （成员最前，打开面板即落在成员上；「角色」那一整节从成员块里搬出来、独立成一块 —— 来源筛选、
+// 角色卡、导出 / 导入、添加 / 修改 / 下架 / 删除 / 恢复与角色包弹窗全在这一块）。
+// 数据：GET /company-board/api（任务看板那份视图）
+//       + /company-board/api/status（三行状态）
+//       + /company-board/api/members（成员块与角色块：名册读数 + 运行时状态 + 头像映射
+//         + 角色目录 `defaults` —— 两块读同一份载荷，各画各的那一半）
+//       + /company-board/api/skills{,/definition}（技能块：宿主技能注册表 `ctx.skills` 的目录与正文），
+//       由本包 host half（lib/board-view.host.js）提供。两个文件里的 API_PREFIX 必须一致。
+// 工作区：这一栏按会话渲染，订阅 `sessions.list`，把**当前会话的工作目录**作为
+//       `?workspace=` 传给端点 ⇒ 切换会话/工作区时跟着变，而不是只认 composition 行里
+//       配的那一个常量（那是取不到会话时的回落值）。
+//
+// 分区地图（**这份地图与下面各分区的横幅是一对**：横幅写作 `// ── <编号> <名字>`；
+// 自检按"地图里列出的每一条都有同名横幅、且顺序一致"钉住 —— 插了新分区不更新地图会红）：
+//   ① 种子、席位与防御      requireSeed / React / clientCtx（工厂抛异常会拖垮整个 web shell，见头注）
+//   ② 端点与常量            所有 HTTP 端点、上限常量、PANE_MARK
+//   ③ 取数缓存与 URL         paneCache / getJsonCached / 三个 URL 拼装
+//   ④ 界面规格与配色         SPECS / BLOCKS / TONE_VAR（四块的名字与顺序就在这里）
+//   ⑤ 样式表                 CSS 数组（所有 .cbv-* 类名与配色变量都只在这一处）
+//   ⑥ 渲染原语与 Markdown    el / text / markdownNodes（浮窗里的表格也走它）
+//   ⑦ 头像、分栏与卡片原语    AVATAR_ICONS / boardCard / CARD_SHELL_PROPS
+//   ⑧ 会话、工作区与高度      订阅 sessions、取当前工作区/会话 id、量高度
+//   ⑨ 词表与分栏规格         成员/技能的状态词与分档、团队任务板三栏
+//   ⑩ 状态视图与任务板        StatusView / TaskBoardView（视图栏里那一栏的内容）
+//   ⑪ 角色触发源与输入框席位   rosterCache / RoleComposerEntry（`@` 菜单与那枚「角色」按钮）
+//   ⑫ 成员块                 MembersView（卡片、筛选、只读动作「查看/复制提示词」；成员写面已撤）
+//   ⑬ 角色块                 RolesView + rosterSectionOf（来源筛选、角色卡增删改、导出导入、角色包弹窗）
+//   ⑭ 技能块                 SkillsView（清单、正文浮窗、导入/新建/删除）
+//   ⑮ 任务看板块              原生任务板三栏 + 详情浮窗（本插件看板那一档已撤：任务在原生那本账上）
+//   ⑯ 装配与导出              insertStyles / apply / 席位导出
+//
+// 防御约定（照 dsh-dream-skin 的教训）：loader 不隔离各入口工厂，一个抛出的
+// 工厂会被聚合成 “entries did not activate” 并把整个 web shell 拖垮。因此
+// 种子解析全部包在 try 里，失败时导出一个「哑模块」——插件隐身，页面安然。
+
+window.__ModuleLoader__.load({
+	id: 'dsh-team-ops',
+	factory: (require) => {
+		var module = { exports: {} }
+		var exports = module.exports
+		Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
+

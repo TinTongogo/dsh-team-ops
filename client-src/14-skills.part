@@ -1,0 +1,863 @@
+		// ── ⑭ 技能块 ─────────────────────────────────────────────────────
+		function SkillsView(props) {
+			const store = props.sessions === undefined ? null : typeof props.sessions === 'function' ? props.sessions() : props.sessions
+			const workspace = useCurrentWorkspace(store)
+			// 会话 id 必须带上：技能目录按会话层解析（同一根、不同预设不同目录），不带只能读全局层；
+			// 子智能体对话折到根会话（子会话没在跑时宿主只能退层并告警）。
+			const sessionId = useCurrentSessionId(store)
+			const teamSessionId = teamSessionIdOf(store, sessionId)
+			const target = skillsUrlOf(workspace, teamSessionId)
+			const [snapshot, setSnapshot] = React.useState({ phase: 'loading' })
+			const [localTick, setLocalTick] = React.useState(0)
+			// 三个写动作（导入 / 新建 / 删除）共用一只浮窗：`{ mode, root, source, name, description, body, busy, error }`。
+			const [writer, setWriter] = React.useState(null)
+			const [sourceFacet, setSourceFacet] = React.useState('all')
+			const [query, setQuery] = React.useState('')
+			// 查看正文浮窗：`{ skill, definition }` 或 null；`definition` 单独取（清单里没有正文）。
+			const [viewer, setViewer] = React.useState(null)
+			const [busy, setBusy] = React.useState(null)
+			// 块顶回执（设计 ⑥.1）：`{ tone, lines, retry? }`。
+			const [notice, setNotice] = React.useState(null)
+			const active = props.active !== false
+			const showSkeleton = useSkeletonVisible(snapshot.phase === 'loading')
+			// 防重复提交的同步闸（两次点击落在同一轮里时 state 还没更新）。
+			const busyRef = React.useRef(false)
+			// 浮窗可达性：Esc 关 / Tab 圈闭 / 关闭归还焦点。删除确认走 `ConfirmDialog`（它自己那一套）。
+			const writerModalRef = useModalA11y(writer !== null && text(writer.mode) !== 'remove', () => {
+				if (writer !== null && writer.busy === true) return
+				setWriter(null)
+			})
+			const viewerModalRef = useModalA11y(viewer !== null, () => setViewer(null))
+
+			React.useEffect(() => {
+				if (!active) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setSnapshot({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				getJsonCached(target)
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null) {
+							setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: 'HTTP ' + response.status + '：响应不是 JSON' }))
+							return
+						}
+						if (payload.ok === true) {
+							setSnapshot({ phase: 'ready', data: payload })
+							return
+						}
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }))
+					})
+					.catch((error) => {
+						if (cancelled) return
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: '' + error }))
+					})
+				return () => {
+					cancelled = true
+				}
+			}, [props.reload, localTick, target, active])
+
+			/** 取一个技能的正文（宿主按 name 现读**当前**那一份，不缓存 —— 正文改过就拿到新的）。 */
+			const loadDefinition = async (name) => {
+				if (typeof fetch !== 'function') return null
+				// 正文与清单必须**同一个视图层**：所以同样带上 session（少了它可能读到另一个层的那一条）。
+				const url = SKILL_DEFINITION_ENDPOINT + '?name=' + encodeURIComponent(name) + paneQueryOf(workspace, teamSessionId)
+				const response = await getJsonCached(url)
+				const payload = await response.json().catch(() => null)
+				if (payload === null || payload.ok !== true) {
+					const why = payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status
+					setNotice({ tone: 'error', lines: ['读不到技能正文：' + why] })
+					return null
+				}
+				return payload
+			}
+
+			const openViewer = async (skill) => {
+				setNotice(null)
+				setBusy('正在读取正文…')
+				try {
+					const definition = await loadDefinition(skill.name)
+					if (definition !== null) setViewer({ skill, definition })
+				} catch (error) {
+					setNotice({ tone: 'error', lines: ['读不到技能正文：' + error] })
+				} finally {
+					setBusy(null)
+				}
+			}
+
+			/** 「复制正文」：正文不在清单里，所以要现取一次（与浮窗里那个复制按钮同一份文本）。 */
+			const copyBody = async (skill) => {
+				setNotice(null)
+				setBusy('正在读取正文…')
+				try {
+					const definition = await loadDefinition(skill.name)
+					if (definition === null) return
+					const copied = await copyText(definition.content)
+					setNotice(
+						copied.ok
+							? { tone: 'ok', lines: [`已复制 ${skill.name} 的正文（${definition.chars} 字）。`, definition.truncated === true ? '注意：宿主那边正文超长，返回的是截断后的一段（详情见浮窗里的那一行）。' : ''].filter((line) => line !== '') }
+							: { tone: 'error', lines: ['复制失败：' + copied.reason] },
+					)
+				} catch (error) {
+					setNotice({ tone: 'error', lines: ['读不到技能正文：' + error] })
+				} finally {
+					setBusy(null)
+				}
+			}
+
+			/** 「复制路径」：清单里就有（`path`），不用再取一次；没有路径就**如实说没有**。 */
+			const copyPath = async (skill) => {
+				const path = text(skill.path)
+				if (path === '') {
+					setNotice({ tone: 'error', lines: [`技能 ${skill.name} 没有指令文件路径（来源「${text(skill.source)}」没给）。`] })
+					return
+				}
+				const copied = await copyText(path)
+				setNotice(copied.ok ? { tone: 'ok', lines: ['已复制指令文件路径：' + path] } : { tone: 'error', lines: ['复制失败：' + copied.reason] })
+			}
+
+			const data = snapshot.phase === 'ready' ? snapshot.data : null
+			const skills = data !== null && Array.isArray(data.skills) ? data.skills : []
+			const warnings = data !== null && Array.isArray(data.warnings) ? data.warnings : []
+
+			// **层级筛档**：来自载荷（`facets`）；载荷没给就不画（不自己编档）
+			const skillFacets = data !== null && data !== undefined && Array.isArray(data.facets) ? data.facets : []
+			const needle = query.trim().toLowerCase()
+			const visible = skills.filter(
+				(skill) =>
+					// **按层级筛**（task-38）：层级由服务端给（`skill.level`），前端不按原始 source 自己判。
+					(sourceFacet === 'all' || text(skill.level) === sourceFacet) &&
+					(needle === '' || haystackOf(skill).indexOf(needle) !== -1),
+			)
+			const sourceWordOf = (source) => {
+				const key = text(source)
+				return key === '' ? '（未标来源）' : SKILL_SOURCE_WORDS[key] ?? key
+			}
+
+			const cardOf = (skill, index) => {
+				const name = text(skill.name)
+				// **两枚标签**（人的口径）：层级（项目级 / 用户级 / 包内，词取载荷 `levelLabel`）+
+				// 提供者（载荷 `provider` 原文）。原来那行「来源 … · 提供者 …」不再印 ——
+				// 「来源」与层级标签说的是同一件事（随包目录 ≈ 包内），重复。
+				const levelLabel = text(skill.levelLabel)
+				const provider = text(skill.provider)
+				return el(
+					'div',
+					{
+						className: 'cbv-box cbv-sk-card',
+						key: 'skill' + index + '#' + name,
+						// 形态与判定落在 `data-` 上（不挂 title）：核对的人不必展开 DOM 找文字。
+						'data-skill-name': name,
+						'data-skill-source': text(skill.source),
+						// **层级**（task-38）：`level` / `levelLabel` 都来自载荷
+						'data-skill-level': text(skill.level),
+						'data-skill-level-label': levelLabel,
+						'data-skill-provider': provider,
+					},
+					el('div', { className: 'cbv-sk-name', key: 'name' }, name === '' ? '（无名）' : name),
+					// 层级与提供者都做成标签；两格都没有就不画这一行（不印空行占位）。
+					levelLabel === '' && provider === ''
+						? null
+						: el(
+								'div',
+								{ className: 'cbv-badges', key: 'badges' },
+								levelLabel === '' ? null : el('span', { className: 'cbv-badge', key: 'lvl' }, levelLabel),
+								provider === '' ? null : el('span', { className: 'cbv-badge', key: 'prov' }, provider),
+							),
+					el('div', { className: 'cbv-sk-desc', key: 'desc' }, text(skill.description) === '' ? '（宿主没给这一条的 description）' : text(skill.description)),
+					text(skill.whenToUse) === '' ? null : el('div', { className: 'cbv-sk-when', key: 'when' }, '什么时候用它：' + text(skill.whenToUse)),
+					el(
+						'div',
+						{ className: 'cbv-cardbar', key: 'actions' },
+						el('button', { className: 'cbv-cardbtn', key: 'view', type: 'button', disabled: busy !== null, onClick: () => openViewer(skill) }, '查看正文'),
+						el('button', { className: 'cbv-cardbtn', key: 'copy', type: 'button', disabled: busy !== null, onClick: () => copyBody(skill) }, '复制正文'),
+						el('button', { className: 'cbv-cardbtn', key: 'path', type: 'button', onClick: () => copyPath(skill) }, '复制路径'),
+						// **只对可写来源画删除**：随包发布的（`bundled`）与别的 agent 的根（`*-agents`）只读
+						// —— 写入口那侧同样会拒，两处同一口径（`WRITABLE_SKILL_SOURCES`）。
+						WRITABLE_SKILL_SOURCES[text(skill.source)] === undefined
+							? null
+							: el(
+									'button',
+									{
+										className: 'cbv-cardbtn',
+										key: 'remove',
+										type: 'button',
+										'data-skill-remove': name,
+										disabled: busy !== null,
+										onClick: () => openWriter({ mode: 'remove', root: WRITABLE_SKILL_SOURCES[text(skill.source)], name }),
+									},
+									'删除',
+								),
+					),
+				)
+			}
+
+			/**
+			 * 把拖进来的东西收成 `[{ path, dataBase64 }]`。
+			 *
+			 * 浏览器只给**文件内容**（拿不到绝对路径），所以走"上传"这条：`webkitGetAsEntry()` 拿到目录条目
+			 * 再递归读；`path` 用相对路径（拖一个文件夹时每条都以它开头，宿主那侧会去掉公共前缀）。
+			 * 读不到的条目**跳过并计数**（不静默丢，收完在界面上说清）。
+			 */
+			const collectDropped = async (dataTransfer) => {
+				const out = []
+				let skipped = 0
+				const readFile = async (file, path) => {
+					try {
+						const buffer = await file.arrayBuffer()
+						let binary = ''
+						const bytes = new Uint8Array(buffer)
+						for (let at = 0; at < bytes.length; at += 1) binary += String.fromCharCode(bytes[at])
+						out.push({ path, dataBase64: btoa(binary) })
+					} catch {
+						skipped += 1
+					}
+				}
+				const walk = async (entry, prefix) => {
+					if (entry === null || entry === undefined) return
+					const path = prefix === '' ? entry.name : prefix + '/' + entry.name
+					if (entry.isFile === true) {
+						const file = await new Promise((resolve) => entry.file(resolve, () => resolve(null)))
+						if (file === null) {
+							skipped += 1
+							return
+						}
+						await readFile(file, path)
+						return
+					}
+					if (entry.isDirectory !== true) return
+					const reader = entry.createReader()
+					const entries = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])))
+					for (const child of entries) await walk(child, path)
+				}
+				const items = dataTransfer === null || dataTransfer === undefined ? [] : Array.from(dataTransfer.items ?? [])
+				const entries = items.filter((item) => item.kind === 'file' && typeof item.webkitGetAsEntry === 'function').map((item) => item.webkitGetAsEntry())
+				if (entries.length > 0) {
+					for (const entry of entries) await walk(entry, '')
+					return { files: out, skipped }
+				}
+				// 退一档：拿不到 entry（老环境）时用 `files`，路径就是文件名本身。
+				for (const file of Array.from(dataTransfer?.files ?? [])) await readFile(file, file.name)
+				return { files: out, skipped }
+			}
+
+			/** 与拖拽同一件事的"手选"路：`<input type=file>` 选完给的是 `File` 清单（`webkitRelativePath` 带目录）。 */
+			const collectPicked = async (fileList) => {
+				const out = []
+				let skipped = 0
+				for (const file of Array.from(fileList ?? [])) {
+					try {
+						const buffer = await file.arrayBuffer()
+						let binary = ''
+						const bytes = new Uint8Array(buffer)
+						for (let at = 0; at < bytes.length; at += 1) binary += String.fromCharCode(bytes[at])
+						out.push({ path: text(file.webkitRelativePath) === '' ? file.name : text(file.webkitRelativePath), dataBase64: btoa(binary) })
+					} catch {
+						skipped += 1
+					}
+				}
+				return { files: out, skipped }
+			}
+
+			/** 这一批的实际字节数（base64 逆向估：长度 × 3/4，够用且不解析内容）。 */
+			const weightOfFiles = (files) => files.reduce((sum, item) => sum + Math.floor((item.dataBase64.length * 3) / 4), 0)
+
+			/** 收到一批（拖进来或选进来）之后统一落库：文件清单 + 跳过计数 + 体量 + 算出来的技能名。 */
+			const takeFiles = (result) => {
+				const summary = droppedSummaryOf(result.files)
+				const bytes = weightOfFiles(result.files)
+				// **先自检，别让请求把连接撑爆**（宿主读到超限会回 413；面板这一步是让人早一步看到原因）。
+				const why =
+					result.files.length > SKILL_IMPORT_MAX_FILES
+						? `这批有 ${result.files.length} 个文件（上限 ${SKILL_IMPORT_MAX_FILES}）。`
+						: bytes > SKILL_IMPORT_MAX_BYTES
+							? `这批约 ${(bytes / 1024 / 1024).toFixed(1)} MB（上限 ${SKILL_IMPORT_MAX_BYTES / 1024 / 1024} MB）。`
+							: summary.hasSkill
+								? ''
+								: '这批里没有 SKILL.md。'
+				setWriter((current) => (current === null ? current : { ...current, files: result.files, skipped: result.skipped, bytes, name: summary.name, error: why }))
+			}
+
+			const takeDropped = async (dataTransfer) => {
+				if (writer === null) return
+				const result = await collectDropped(dataTransfer)
+				takeFiles(result)
+			}
+
+			/**
+			 * 手选：开一个隐藏的 `<input type=file>` 点一下（拖拽的等价路）。
+			 * 目录用 `webkitdirectory`（选完每条带 `webkitRelativePath`），文件用 `multiple` + `.md` 过滤。
+			 */
+			const pickInto = (kind) => {
+				if (typeof document === 'undefined' || document === null || typeof document.createElement !== 'function') return
+				try {
+					const input = document.createElement('input')
+					input.type = 'file'
+					if (kind === 'dir') input.webkitdirectory = true
+					else {
+						input.multiple = true
+						input.accept = '.md,text/markdown'
+					}
+					input.onchange = () => void collectPicked(input.files).then((result) => takeFiles(result))
+					input.click()
+				} catch {
+					setWriter((current) => (current === null ? current : { ...current, error: '这个环境不给开文件选择框，请直接拖入。' }))
+				}
+			}
+
+			/** 收完那一批之后：算一下"这份技能叫什么、几个文件"，摆在拖拽区下面（人就看得见要不要按确定）。 */
+			const droppedSummaryOf = (files) => {
+				const skillFile = files.find((item) => item.path === 'SKILL.md' || item.path.endsWith('/SKILL.md'))
+				if (skillFile === undefined) return { name: '', count: files.length, hasSkill: false }
+				const prefix = skillFile.path === 'SKILL.md' ? '' : skillFile.path.slice(0, skillFile.path.length - 'SKILL.md'.length).replace(/\/$/, '')
+				const first = prefix === '' ? '' : prefix.split('/')[0]
+				const declared = declaredNameIn(skillFile.dataBase64)
+				return { name: declared !== '' ? declared : first, count: files.length, hasSkill: true }
+			}
+
+			/** 从 base64 的 `SKILL.md` 里读 front-matter 的 `name:`（读不出就给空串）。 */
+			const declaredNameIn = (dataBase64) => {
+				try {
+					const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(atob(dataBase64))
+					if (match === null) return ''
+					const line = /^\s*name\s*:\s*(.+?)\s*$/m.exec(match[1])
+					return line === null ? '' : line[1].replace(/^["']|["']$/g, '').trim()
+				} catch {
+					return ''
+				}
+			}
+
+			/** 打开写动作浮窗（三个动作共用）。 */
+			const openWriter = (next) => {
+				setNotice(null)
+				setWriter({ busy: false, error: '', ...next })
+			}
+
+			/**
+			 * 提交一个写动作（POST 到宿主那三个端点）。
+			 *
+			 * 判定与落盘在宿主（`lib/skill-write.js`）—— 面板只把回执**原文**摆出来：
+			 * 成功印一行"已导入/已新建/已删除 + 名称 + 落在哪个根"，失败印宿主给的那句原因。
+			 */
+			const submitWriter = async () => {
+				if (writer === null || typeof fetch !== 'function') return
+				const endpoint =
+					writer.mode === 'import' ? SKILLS_IMPORT_ENDPOINT : writer.mode === 'create' ? SKILLS_CREATE_ENDPOINT : SKILLS_REMOVE_ENDPOINT
+				if (writer.mode === 'import' && writer.files.length === 0) {
+					setWriter({ ...writer, error: '还没收到文件。' })
+					return
+				}
+				if (writer.mode === 'import' && writer.error !== '') return
+				// 防重复提交：入口再判一次（state 在同一轮里还是旧的，所以再加一道同步闸）。
+				if (busyRef.current || writer.busy === true) return
+				busyRef.current = true
+				const body =
+					writer.mode === 'import'
+						? { root: writer.root, name: writer.name, files: writer.files }
+						: writer.mode === 'create'
+							? { root: writer.root, name: writer.name, description: writer.description, body: writer.body }
+							: { root: writer.root, name: writer.name }
+				setWriter({ ...writer, busy: true, error: '' })
+				try {
+					const response = await fetch(endpoint + paneQueryOf(workspace, teamSessionId), {
+						method: 'POST',
+						headers: { 'content-type': 'application/json', accept: 'application/json' },
+						credentials: 'same-origin',
+						body: JSON.stringify(body),
+					})
+					const payload = await response.json().catch(() => null)
+					if (payload === null || payload.ok !== true) {
+						const why = payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status
+						setWriter({ ...writer, busy: false, error: why })
+						return
+					}
+					// 写成功 ⇒ **先清缓存**（这一块自己的重取由下面的 `localTick` 触发）。
+					// 放在这里而不是收尾处：面板那条"写动作附近必须失效缓存"的扫描按行距离判，收尾太远会判成漏失效。
+					invalidatePanes()
+					const word = writer.mode === 'import' ? '已导入' : writer.mode === 'create' ? '已新建' : '已删除'
+					// **删技能时同步剪角色那一行**（HD-007）：回执里的 `skillPrune.note` **原样印出来** ——
+					// 它逐字说清"改了哪几个用户根角色、还有哪几个包内角色仍声明它"（面板不复述、也不总结成"已同步"）。
+					const pruneLines =
+						payload.skillPrune !== null && payload.skillPrune !== undefined && text(payload.skillPrune.note) !== ''
+							? [`专属技能同步：${text(payload.skillPrune.note)}`]
+							: []
+					// **这一栏会不会立刻刷新**取决于宿主用上了哪一档失效（`skillCatalog`）：
+					// 有失效入口 ⇒ 清单当场重取；一档都没有 ⇒ 如实说"要重启/新会话"。
+					const catalogState = text(payload.skillCatalog)
+					const refreshLine =
+						catalogState === '' || catalogState === 'none' || catalogState === 'no-service'
+							? '注册表没有失效入口：重启 DSH 或开新会话才刷新。'
+							: '技能目录已失效，正在重取。'
+					// **新建了却看不见**（设计 4.3.2）：当前筛选非缺省时补一句；筛选条件由人自己清。
+					const filteredNow = sourceFacet !== 'all' || query.trim() !== ''
+					const filterLines = filteredNow ? ['它被当前筛选排除了。'] : []
+					setNotice({
+						tone: 'ok',
+						lines: [`${word}技能 \`${text(payload.id)}\`：${text(payload.path)}`, refreshLine, ...pruneLines, ...filterLines],
+						...(filteredNow ? { onClearFilters: () => clearFilters() } : {}),
+					})
+					setWriter(null)
+					setLocalTick((value) => value + 1)
+				} catch (error) {
+					// `Failed to fetch` 这一类是连接层面的失败（宿主没回话）。把可能的原因写出来 ——
+					// 但正常路径下不该走到这儿：体量在收集那一步就自检过了，宿主也会回一个能读的 413。
+					const raw = String(error)
+					setWriter({
+						...writer,
+						busy: false,
+						error: /failed to fetch/i.test(raw)
+							? '没能连上宿主（连接被中断）：把技能要用的文件拖进来再试；仍失败就重启 DSH。'
+							: raw,
+					})
+				} finally {
+					busyRef.current = false
+				}
+			}
+
+			/** 写动作浮窗：导入 / 新建 / 删除三态（同一只浮窗，按 `mode` 换字段）。 */
+			const writerOverlay = () => {
+				const row = (label, node, note) =>
+					el(
+						'div',
+						{ className: 'cbv-mp-field', key: label },
+						el('div', { className: 'cbv-mp-field-label', key: 'label' }, label),
+						node,
+						note === undefined ? null : el('div', { className: 'cbv-mp-field-note', key: 'note' }, note),
+					)
+				// **写哪一级**（task-38）：选项与文案**都来自载荷** `targets`（服务端那一处正文），
+				// 缺省取载荷给的 `targetDefault`（= 项目级）；措辞与「角色」弹窗那一格一致。
+				const skillTargets = data !== null && data !== undefined && Array.isArray(data.targets) ? data.targets : []
+				const rootPicker = row(
+					'落到哪一级',
+					skillTargets.length === 0
+						? el('div', { className: 'cbv-mp-field-note', key: 'no-targets' }, '读不到技能目录。')
+						: el(
+								'select',
+								{
+									className: 'cbv-select',
+									'data-skill-root': '',
+									value: writer.root,
+									onChange: (event) => setWriter({ ...writer, root: event.target.value, error: '' }),
+								},
+								skillTargets.map((target) =>
+									el('option', { value: target.key, key: target.key }, `${text(target.label)} ${text(target.path)}（${'note' in target ? text(target.note).replace(/\*\*/g, '') : ''}）`),
+								),
+							),
+				)
+				const fields =
+					writer.mode === 'import'
+						? [
+								rootPicker,
+								el(
+									'div',
+									{ className: 'cbv-mp-field', key: 'drop' },
+									el('div', { className: 'cbv-mp-field-label', key: 'label' }, '来源'),
+									el(
+										'div',
+										{
+											className: 'cbv-drop' + (writer.busy === true ? '' : ' cbv-drop--on'),
+											key: 'zone',
+											// 拖拽只是快捷方式：**键盘等价路径**在区上（Enter / Space 打开文件夹选择）。
+											tabIndex: 0,
+											role: 'group',
+											'aria-label': '拖拽技能到此处，或按回车选择文件夹',
+											'data-autofocus': '',
+											'data-skill-drop': writer.files.length === 0 ? 'empty' : 'ready',
+											onKeyDown: (event) => {
+												if (event === null || event === undefined) return
+												if (event.key === 'Enter' || event.key === ' ') {
+													event.preventDefault()
+													if (writer.busy !== true) pickInto('dir')
+												}
+											},
+											onDragOver: (event) => {
+												event.preventDefault()
+											},
+											onDrop: (event) => {
+												event.preventDefault()
+												void takeDropped(event.dataTransfer)
+											},
+										},
+										el('div', { className: 'cbv-drop-title', key: 't' }, '拖拽技能到此处'),
+										el('div', { className: 'cbv-drop-note', key: 'n' }, '支持技能文件夹，或单个 SKILL.md'),
+										el(
+											'div',
+											{ className: 'cbv-drop-acts', key: 'a' },
+											el('button', { className: 'cbv-drop-link', key: 'dir', type: 'button', 'data-skill-pick': 'dir', onClick: () => pickInto('dir') }, '选择文件夹'),
+											el('span', { className: 'cbv-drop-sep', key: 'sep' }, '／'),
+											el('button', { className: 'cbv-drop-link', key: 'file', type: 'button', 'data-skill-pick': 'file', onClick: () => pickInto('file') }, '选择文件'),
+										),
+										// **文件要求写在拖拽区里面**（人的指令）—— 它讲的就是"往这个区里放什么"。
+										el(
+											'div',
+											{ className: 'cbv-drop-req', key: 'req' },
+											el('div', { key: 'r1' }, inlineNodes('· 文件夹或单个 `.md`，且必须含 `SKILL.md`', 'req1')),
+											el('div', { key: 'r2' }, inlineNodes('· 技能名优先取 `SKILL.md` 里 front-matter 的 `name`，否则取文件夹名', 'req2')),
+											el('div', { key: 'r3' }, inlineNodes('· 导入时**复制完整内容**，不动原始来源', 'req3')),
+										),
+									),
+									// 区下面只留**收完之后的那一行读数**（没收东西时不必重复区里那三条）。
+									writer.files.length === 0
+										? null
+										: el(
+												'div',
+												{
+													className: 'cbv-mp-field-note cbv-md',
+													key: 'picked',
+													'data-skill-picked': '' + writer.files.length,
+												},
+												markdownNodes(
+													`已收 ${writer.files.length} 个文件 · 约 ${(Number(writer.bytes ?? 0) / 1024 / 1024).toFixed(1)} MB${writer.skipped === 0 ? '' : `（${writer.skipped} 个读不到，已跳过）`}；技能名 = ${text(writer.name) === '' ? '（要从 SKILL.md 里读）' : '`' + text(writer.name) + '`'}`,
+													'picked',
+												),
+											),
+								),
+							]
+						: writer.mode === 'create'
+							? [
+									rootPicker,
+									row(
+										'技能名',
+										el('input', {
+											className: 'cbv-input',
+											'data-autofocus': '',
+											'data-skill-field': 'name',
+											value: writer.name,
+											placeholder: 'lower-kebab-case，例如 qa-playbook',
+											onChange: (event) => setWriter({ ...writer, name: event.target.value, error: '' }),
+										}),
+									),
+									row(
+										'一句话说明',
+										el('input', {
+											className: 'cbv-input',
+											'data-skill-field': 'description',
+											value: writer.description,
+											placeholder: 'Use when …（写清什么时候该用它）',
+											onChange: (event) => setWriter({ ...writer, description: event.target.value, error: '' }),
+										}),
+									),
+									row(
+										'正文',
+										el('textarea', {
+											className: 'cbv-mp-textarea',
+											'data-skill-field': 'body',
+											rows: 8,
+											value: writer.body,
+											placeholder: '这份技能的作业程序：怎么做、检查什么、产出什么',
+											onChange: (event) => setWriter({ ...writer, body: event.target.value, error: '' }),
+										}),
+									),
+								]
+							: [
+									el(
+										'div',
+										{ className: 'cbv-mp-field', key: 'confirm' },
+										el('div', { className: 'cbv-mp-field-label' }, '确认删除'),
+										el(
+											'div',
+											{ className: 'cbv-note cbv-note--danger cbv-md', 'data-skill-confirm': writer.name },
+											markdownNodes(`删掉 \`${writer.name}\`（${skillRootWordOf(writer.root)}）：整棵目录都会没了，这是不可逆的。`, 'confirm'),
+										),
+									),
+								]
+				const title = writer.mode === 'import' ? '导入技能' : writer.mode === 'create' ? '新建技能' : '删除技能'
+				return el(
+					'div',
+					{ className: 'cbv-overlay', key: 'overlay', onClick: () => setWriter(null) },
+					el(
+						'div',
+						{
+							className: 'cbv-modal cbv-modal--skills cbv-modal--narrow',
+							key: 'modal',
+							role: 'dialog',
+							'aria-modal': 'true',
+							'aria-label': title,
+							ref: writerModalRef,
+							tabIndex: -1,
+							'data-skill-dialog': writer.mode,
+							onClick: (event) => event.stopPropagation(),
+						},
+						el(
+							'div',
+							{ className: 'cbv-modal-head', key: 'head' },
+							el('span', { className: 'cbv-modal-title', key: 'title' }, title),
+							el(
+								'div',
+								{ className: 'cbv-modal-actions', key: 'actions' },
+								el('button', { className: 'cbv-btn', key: 'cancel', type: 'button', onClick: () => setWriter(null) }, '取消'),
+								el(
+									'button',
+									{
+										className: 'cbv-btn',
+										key: 'ok',
+										type: 'button',
+										disabled:
+											writer.busy === true ||
+											(writer.mode === 'import' && (writer.files.length === 0 || writer.error !== '')) ||
+											(writer.mode === 'create' && idShapeOk(writer.name) !== true),
+										onClick: () => void submitWriter(),
+									},
+									writer.busy === true ? '正在提交…' : '确定',
+								),
+							),
+						),
+						el(
+							'div',
+							{ className: 'cbv-modal-body', key: 'body' },
+							writer.mode === 'import'
+								? el('div', { className: 'cbv-mp-field-note cbv-md', key: 'tip' }, markdownNodes('只写用户级 / 项目级；同名一律拒绝。', 'tip'))
+								: null,
+							...fields,
+							writer.error === '' ? null : el('div', { className: 'cbv-note cbv-note--danger', key: 'error', 'data-skill-error': '' }, writer.error),
+						),
+					),
+				)
+			}
+
+			/** 写入口的根名（回执里那一句用；与浮窗里选项的措辞一致）。 */
+			const skillRootWordOf = (kind) => (kind === 'project' ? '项目级技能根' : '用户级技能根')
+
+			/** 正文浮窗：`<pre>` 原样摊开（不渲染 Markdown —— 这是一份要**原样**带走/核对的正文）。 */
+			const viewerOverlay = () => {
+				const definition = viewer.definition
+				const content = text(definition.content)
+				return el(
+					'div',
+					{ className: 'cbv-overlay', key: 'overlay', onClick: () => setViewer(null) },
+					el(
+						'div',
+						{ className: 'cbv-modal cbv-modal--skills', onClick: (event) => event.stopPropagation(), role: 'dialog', 'aria-modal': 'true', 'aria-label': viewer.skill.name + ' 技能正文', ref: viewerModalRef, tabIndex: -1, 'data-skill-dialog': viewer.skill.name },
+						el(
+							'div',
+							{ className: 'cbv-modal-head', key: 'head' },
+							el('span', { className: 'cbv-modal-title', key: 'title' }, viewer.skill.name),
+							el(
+								'div',
+								{ className: 'cbv-modal-actions', key: 'actions' },
+								el(
+									'button',
+									{
+										className: 'cbv-btn',
+										key: 'copy',
+										type: 'button',
+										onClick: async () => {
+											const copied = await copyText(content)
+											setNotice(copied.ok ? { tone: 'ok', lines: [`已复制 ${viewer.skill.name} 的正文。`] } : { tone: 'error', lines: ['复制失败：' + copied.reason] })
+										},
+									},
+									'复制',
+								),
+								el('button', { className: 'cbv-btn', key: 'close', type: 'button', onClick: () => setViewer(null) }, '关闭'),
+							),
+						),
+						el(
+							'div',
+							{ className: 'cbv-modal-body', key: 'body' },
+							el(
+								'div',
+								{ className: 'cbv-pane-note cbv-md', key: 'meta' },
+								markdownNodes(
+									'来源：' + sourceWordOf(definition.source) + '（`' + text(definition.source) + '`）　提供者：' + (text(definition.provider) === '' ? '（未标）' : text(definition.provider)) + '　路径：' + (text(definition.path) === '' ? '（没给）' : text(definition.path)) + '　' + definition.chars + ' 字',
+									'viewer-meta',
+								),
+							),
+							// 宿主那边超长会截断：**截断要说出来**，不能让人以为技能正文就这么短。
+							definition.truncated === true
+								? el('div', { className: 'cbv-pane-warn cbv-md', key: 'trunc' }, markdownNodes('正文超长，已截断（复制的是截断版）。', 'trunc'))
+								: null,
+							el('pre', { className: 'cbv-block cbv-pre', key: 'text' }, content === '' ? '（这份技能的文件里没有正文）' : content),
+						),
+					),
+				)
+			}
+
+			// **落空与读失败都给人下一步**：前者清掉筛选（级别 / 搜索两个状态一起清），后者当场重读一次。
+			// 重读就走本块自己的取数计数（`invalidatePanes()` 把 3 秒缓存清掉，`localTick` 触发 effect）。
+			const clearFilters = () => {
+				setSourceFacet('all')
+				setQuery('')
+			}
+			const retry = () => {
+				invalidatePanes()
+				setLocalTick((value) => value + 1)
+			}
+
+			// 加载态：工具栏 / 骨架位置固定（骨架 3 张技能卡，工具栏保留 —— 设计 5.3 / P-06）。
+			if (snapshot.phase === 'loading') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-sk', 'data-skills-phase': 'loading', 'data-skills-state': 'ok', 'data-skills-mark': SKILLS_MARK },
+					el(
+						'div',
+						{ className: 'cbv-flt-bar', key: 'skeleton-toolbar', 'aria-hidden': 'true' },
+						el('span', { className: 'cbv-skel-chip cbv-skel-chip--wide', key: 'c0' }),
+						el('span', { className: 'cbv-skel-search', key: 's' }),
+					),
+					el('span', { className: 'cbv-sr-only', key: 'say' }, '正在读取技能目录…'),
+					showSkeleton ? el(SkeletonList, { kind: 'skills', label: '正在读取技能目录…' }) : null,
+				)
+			}
+			// 整块错误态：只印那一行原文 —— 「技能注册表读不到」不等于「一个技能都没有」；
+			// 加一枚「重读」：宿主刚起来时读不到，界面上要有一个能再试一次的入口。
+			if (snapshot.phase === 'error') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-sk', 'data-skills-phase': 'error', 'data-skills-state': 'degraded', 'data-skills-mark': SKILLS_MARK },
+					el('div', { className: 'cbv-msg cbv-msg--error' }, '读不到技能目录：' + snapshot.error),
+					el('button', { className: 'cbv-btn', key: 'retry', type: 'button', 'data-pane-retry': 'skills', onClick: retry }, '重读'),
+				)
+			}
+
+			const toolbar = el(
+				'div',
+				{ className: 'cbv-flt-bar', key: 'toolbar' },
+				// **级别筛：下拉**（人的口径：技能这块只留这一格下拉 —— 「模型可调用」那排阶段筛已按人的指令撤掉；
+				// 档位与标签都来自载荷 `facets`，服务端那一处正文）。
+				el(
+					'select',
+					{ className: 'cbv-select cbv-flt-select', key: 'source', value: sourceFacet, 'aria-label': '按级别筛选', 'data-skill-level-facet': '', onChange: (event) => setSourceFacet(event.target.value) },
+					el('option', { value: 'all', key: 'all' }, `全部级别（${skills.length}）`),
+					skillFacets.map((facet) => el('option', { value: facet.key, key: facet.key }, `${text(facet.label)}（${facet.count}）`)),
+				),
+				el('input', {
+					className: 'cbv-input cbv-flt-search',
+					key: 'query',
+					type: 'search',
+					value: query,
+					placeholder: '搜索：名称 / 描述 / 什么时候用它 / 路径 / 来源…',
+					'aria-label': '搜索技能',
+					onChange: (event) => setQuery(event.target.value),
+					onKeyDown: (event) => {
+						// Esc 清空搜索并保持焦点（设计 7.1）。
+						if (event !== null && event !== undefined && event.key === 'Escape') {
+							event.preventDefault()
+							setQuery('')
+						}
+					},
+				}),
+				el(
+					'span',
+					{ className: 'cbv-badges', key: 'manage' },
+					el(
+						'button',
+						{
+							className: 'cbv-flt-chip',
+							key: 'import',
+							type: 'button',
+							'data-skill-action': 'import',
+							disabled: busy !== null,
+							onClick: () => openWriter({ mode: 'import', root: text(data?.targetDefault) === '' ? 'project' : text(data.targetDefault), files: [], skipped: 0, name: '' }),
+						},
+						'导入技能',
+					),
+					el(
+						'button',
+						{
+							className: 'cbv-flt-chip',
+							key: 'create',
+							type: 'button',
+							'data-skill-action': 'create',
+							disabled: busy !== null,
+							onClick: () => openWriter({ mode: 'create', root: text(data?.targetDefault) === '' ? 'project' : text(data.targetDefault), name: '', description: '', body: '' }),
+						},
+						'新建技能',
+					),
+				),
+			)
+
+			// **这一份是哪一层读到的**：`session` 才是"与模型同一份"；`root-agent` / `global` 是退而求其次
+			// （宿主会把"为什么退"写进 `warnings`，这里只决定空态那句话怎么说不许骗人）。
+			const layer = text(data.layer) === '' ? 'global' : text(data.layer)
+			const body =
+				skills.length === 0
+					? layer === 'session'
+						? el('div', { className: 'cbv-scroll', key: 'scroll' }, el('div', { className: 'cbv-pane-empty', key: 'empty' }, '技能目录是空的。'))
+						: el(
+								'div',
+								{ className: 'cbv-scroll', key: 'scroll' },
+								el('div', { className: 'cbv-pane-empty cbv-md', key: 'empty' }, markdownNodes(`没读到会话层的技能目录（按「${layer}」读的，见上面的告警）。`, 'degraded')),
+							)
+					: visible.length === 0
+						// 筛选/搜索落空 ⇒ 说清"没有匹配的条目"并给一枚「清除筛选」：
+						// 搜错一个名字就整份清单消失、又没有任何下一步，人会以为数据没了。
+						? el(
+								'div',
+								{ className: 'cbv-scroll', key: 'scroll' },
+								el(
+									'div',
+									{ className: 'cbv-pane-empty cbv-pane-empty--filters', key: 'nofilter' },
+									el('span', { key: 'word' }, `没有匹配的条目（共 ${skills.length} 个技能）。`),
+									el('button', { className: 'cbv-btn', key: 'clear', type: 'button', 'data-filters-clear': 'skills', onClick: clearFilters }, '清除筛选'),
+								),
+							)
+						: el('div', { className: 'cbv-scroll', key: 'scroll' }, el('div', { className: 'cbv-sk-grid', key: 'grid' }, visible.map((skill, index) => cardOf(skill, index))))
+
+			// 空态三分（设计 P-07 / 5.2）：真空（会话层）/ 退层空 / 筛空 / 读不到，各有各的话。
+			const state = skills.length === 0 ? (layer === 'session' ? 'empty' : 'degraded') : visible.length === 0 ? 'filtered' : warnings.length > 0 || snapshot.stale === true ? 'degraded' : 'ok'
+			const removeWriter = writer !== null && text(writer.mode) === 'remove' ? writer : null
+			const removeError = removeWriter !== null && text(removeWriter.error) !== '' ? text(removeWriter.error) : ''
+
+			return el(
+				'div',
+				{
+					className: 'cbv-view cbv-sk',
+					// 形态标记落在 data 上（不挂 title）：核对时在 DOM 里看 `data-skills-mark` 即可。
+					'data-skills-mark': SKILLS_MARK,
+					'data-skills-phase': 'ready',
+					'data-skills-state': state,
+					'data-skills-layer': layer,
+					'data-skills-total': '' + skills.length,
+					'data-skills-visible': '' + visible.length,
+				},
+				// 技能块不再印内页标题（tab 栏已有「技能」）；宿主那几行原文透出、走渲染（标记不上屏）。
+				warnings.map((line, index) => el('div', { className: 'cbv-pane-warn cbv-md', key: 'warn' + index }, markdownNodes(line, 'skills-warn' + index))),
+				// 退层时在头上再点一次名（告警可能在视口外）：只说读的是哪一层，"为什么"看下面那行原文。
+				layer === 'session' ? null : el('div', { className: 'cbv-pane-warn', key: 'layer' }, `清单读的是「${layer}」层（见下面告警）。`),
+				snapshot.stale === true
+					? el(
+							'div',
+							{ className: 'cbv-pane-warn cbv-md', key: 'stale' },
+							markdownNodes('显示的是上一次读数（这一次没读到最新的）。', 'skills-stale'),
+							el('button', { className: 'cbv-btn', key: 'stale-retry', type: 'button', 'data-stale-retry': 'skills', onClick: retry }, '重读'),
+						)
+					: null,
+				toolbar,
+				// 回执紧贴工具栏下方（设计 P-14）：成功 `role=status`、失败 `role=alert`。
+				el(NoticeBar, {
+					slot: 'skills',
+					tone: notice === null ? null : notice.tone,
+					lines: notice === null ? [] : notice.lines,
+					onRetry: notice === null ? undefined : notice.retry,
+					onClearFilters: notice === null ? undefined : notice.onClearFilters,
+					onClose: () => setNotice(null),
+				}),
+				body,
+				viewer === null ? null : viewerOverlay(),
+				writer === null || removeWriter !== null ? null : writerOverlay(),
+				// 删除技能：确认浮窗（动词化 + 危险级 + 默认焦点取消）；取消 = 零写入。
+				el(ConfirmDialog, {
+					open: removeWriter !== null,
+					slot: 'skills-remove',
+					title: removeWriter === null ? '' : '删除技能：' + text(removeWriter.name),
+					lines:
+						removeWriter === null
+							? []
+							: [`删除${text(removeWriter.root) === 'user' ? '用户级' : '项目级'}技能根里 \`${text(removeWriter.name)}/\` 整个目录。不可撤销。`],
+					confirmLabel: '删除技能',
+					busyLabel: '删除中…',
+					danger: true,
+					busy: removeWriter !== null && removeWriter.busy === true,
+					error: removeError,
+					onConfirm: () => void submitWriter(),
+					onCancel: () => {
+						if (removeWriter !== null && removeWriter.busy === true) return
+						setWriter(null)
+					},
+				}),
+			)
+		}
+
+		/** 一个视图 = 一份文件：同一套取数、筛选、分栏，只换卡片与界面约径。 */

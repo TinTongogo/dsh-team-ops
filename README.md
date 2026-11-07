@@ -1,0 +1,214 @@
+# dsh-team-ops
+
+给 **DeepSeek Harness** 装上一支**可叫、可查、可收口**的团队：一批具名角色（架构师 / 开发 / 测试 / 市场 / 法务…），共享一块任务看板；
+成员做完不踢出、不用的不再派活；人只管点头与否决。
+
+一句话说清它跟"多开几个对话框"的差别：**团队的状态可读、可追**。看板与邮箱在 DSH 原生 Agent Teams 里
+（面板与工具读的是同一处），角色清单、你说过的每一句判断、角色开关落在工作区文件里，下一个会话读得到；
+谁在干什么、卡在哪、谁接手，问一句就有答案。
+
+## 装
+
+```bash
+# 装（profile 名自取，现有 profile：ls ~/.dsh/profiles/）
+pnpm --dir ~/.dsh/profiles/desktop add 'git+https://github.com/TinTongogo/dsh-team-ops.git'
+
+# 以后更新就这一条（push 完不 update，DSH 用的是旧那份 —— 这是"我改了怎么没生效"最常见的原因）
+pnpm --dir ~/.dsh/profiles/desktop update dsh-team-ops
+```
+
+确认它在这两处（等价于 `dsh plugin --profile desktop add dsh-team-ops`）：
+
+- `~/.dsh/profiles/desktop/package.json` 的 `dependencies` 里有 `dsh-team-ops`；
+- 同文件 `dsh.profile.bundles` 里有 `dsh-team-ops`。
+
+然后**重启 DSH**；只有前端改动的版本，刷新一次页面即可。
+
+## 装完你会看到什么
+
+- 对话页多一栏 **「团队状态」**：成员 / 角色 / 技能 / 任务看板四块；
+- 输入框左边多一枚 **「角色」** 按钮：点开选一个角色，插进输入框的 `@角色名` 就是**点名** —— 那件事交给那个角色；
+- 输入框右边（发送键旁）多一枚 **「润色」** 按钮：点开是原文 / 润色后的对比浮窗（上面原文只读、下面润色结果 + 词级差异高亮），**采纳**就用润色文本覆盖输入框、**取消**原样不动；只改表达不改事实（数字 / 代码 / 路径 / 链接 / `@引用` 逐字保留，宿主侧还有一道机械校验），含 `@引用` 的草稿不允许润色（会被覆盖成纯文本）；
+- **「角色」是一块**：角色目录（现场枚举 19 个 + 你自己的）里的加 / 改 / 下架 / 导出 / 导入都在那儿；
+- 工作区根会按需出现 `.ops/` 目录，里面是几份纯文本状态文件（可读可查可备份）：`.ops/human.json`（你说过的判断）、`.ops/roles.json`（角色开关）、`roster.json`（角色下架）、`member-flags.json`（成员停用）、`handoff.json`（**交接快照**，见下面「跨会话续接」）、`checkpoints/`（自动压缩的原始转储）。**真源**是人话、角色开关、下架与停用这几份；看板、名册、邮箱的读数都归 DSH 原生 Agent Teams —— 旧的 `board.json` / `members.json` 是**已废弃的遗留文件**：`members.json` **面板不再读它**、也不写；`board.json` 只剩 `/status` 的回落分支会用（原生任务板读不到时）。两份都可以直接删；细节见文末「卸载」一节。旧的 `.company-gate.*` 文件在第一次读写时**自动迁进 `.ops/` 并去掉前缀**（新文件已存在时不动旧的）。
+- 团队工具（`member_*` / `board_task` / `team_status` / `human_words_*` …）出现在工具列表里 ⇒ 说明宿主半边也起来了。
+- 任务看板的卡片显示：任务编号、处理成员、两行描述摘要，以及**交接**（谁 → 谁 / 谁派发，用 `handoff` 工具的 `task` 字段关联）与**冲突任务编号**（取自写盘面重叠告警原文）等标签；完成数看分栏计数，汇总数字不另占一行。完整描述与依赖 / 写盘面 / 告警等详细内容点卡片在浮窗里看。
+
+- `board_task reassign` 派发前校验：必须写明执行人（`assignee` / `owner`）并带 `expected_revision`；任务已有负责人时，**重复分配与他人误派会被阻止**（回执 `conflict` 说明原因），确需转派带 `handover: true`。成功回执带 `assignment`（负责人 / 锁定状态）与 `risks`（依赖未解除、写盘面重叠、成员不在场、并行负载等潜在风险）；面板卡片显示「负责人 X」与「已锁定 / 未锁定」。
+## 怎么用
+
+1. **要一件事**：直接说。协调器判断要不要拆、登记看板、按角色叫人，然后回你结论。
+2. **点名**：`@architect 看一下这个方案` ⇒ 这件活派给架构师（写多个 `@` 就各派一份）。
+3. **问进度**：「现在到哪了」 ⇒ 一句状态行 + 卡在哪。
+4. **加角色**：`npm run role:new -- <角色 id>`（生成 `roles/<id>/ROLE.md` 骨架），改完内容跑 `npm run roster:write`。面板「角色」那一节也能加 / 改 / 下架：**「专属技能」是从技能目录里多选**的（只列当前能载入的；**已声明但本机此刻没有的**仍列出来并标「(本机没有)」—— 技能目录按会话解析，换一个会话它可能在）。**删掉一个技能时**，声明它的**用户根角色**会被同步剪掉那一行，**包内角色只读**（不改发布面）：回执里会点名列出仍声明它的包内角色，想连它们一起去掉就先「改」一份到用户根。
+5. **加技能**：「技能」块上的 **导入技能**（把技能文件夹拖进去）/ **新建技能**。用户级技能给所有会话用，项目级只给这个工作区。
+6. **管人**：面板「成员」每张卡上有 **停用 / 恢复 / 打断** —— **停用** = **本插件不再派活给它**、**不占角色槽位**（同一档至少留 1 位未停用；随时可恢复），**打断** = 只断它当前那一轮（收件箱保留、两条上限不变）。
+   **「停用」只在本插件的调度层生效**：被停用的人在**宿主原生界面里仍然可以打开对话**（宿主没有移除 / 停用成员的接口，**原生名册行只增不减**）—— 要把一个人从会话里彻底隔离，只能**开新会话**。
+   编制两条独立硬上限：**角色槽位 ≤3 位**（同角色未停用且非 `failed` 的人数）、**在场总人数 ≤24 位**（名册行数，含 `failed` 含停用者；与宿主那份 `maxMembers` 同值）。
+
+## 跨会话续接（上下文到极限之后）
+
+任务看板与成员都在 **DSH 原生 Agent Teams** 里，而原生队伍**按会话**（`TeamId = SessionId`）—— 上下文到极限后新开一个会话，原生看板**从零开始**。插件因此在工作区里留一份 **`.ops/handoff.json`**（**交接快照**）：
+
+- 由 `board_task` 改动**以及原生 `team_task_*` 的 `team/task` 事件**自动更新（认领 / 收口 / 转派 / 改字段 / 设依赖 / 重开 / 删除都算；事件路径 250ms 防抖）；内容是 `at`（时刻）、`sessionId`（哪个会话留下的）、三态任务清单（编号 / 标题 / 状态 / owner **角色** / 版本号）、以及这一档用过哪些角色；
+- 新会话开局时可执行 `node lib/ledger-digest.js --text` 读到它（「上个会话（…）留下的**交接快照**：进行中 N 条 / 待办 M 条 …」）。插件**不自动注入**：hook 桥接那一行（`team-ops-hooks`）会让 DSH boot 阶段连不上 web 服务，已永久摘掉。
+
+### 检查点（收口 / 压缩前的落点）
+
+会话压缩会把早期轮次压成摘要、工具结果只留头尾 —— 细节没落盘就真丢了。插件给两处落点：
+
+- **结构化**：`team_checkpoint` 工具把「事实 / 决定 / 产物路径 / 未决 / 下一步」追加到 `docs/team/checkpoints/<task>.md`（可提交、人可读；append-only、512KB 轮转；收口前写一次）。摘要里会显示 `检查点 N`；有已完成任务没写时显示 `缺检查点：task-X 已完成`。
+- **自动**：DSH 自动压缩提交时，`lib/session-watch.js` 把摘要正文与被压事件原文写到 `.ops/checkpoints/compaction/<session>/<compaction>.md`（派生、可删、已 gitignore；每会话留 5 份、单文件按字节截断）；只对**真的有队友在场**的团队会话落盘。
+
+**两句必须记住**：
+
+1. 它是**快照**，**不是**实时看板 —— 实时读数以 `team_status` / `board_task query` 为准；
+2. **成员不能跨会话接手**（名册按会话）：快照只记"该叫哪些角色"，新会话要 `member_spawn role=<id>` **重新叫**，名字会是 `<角色>-1` 这类（原生名册里已用的号不重用），**不是**沿用旧名字。
+
+## 角色（现场枚举 `roles/`）
+
+<!-- ROSTER:BEGIN —— 本段由 `lib/roster.js` 生成，别手改；改角色请加/删 `roles/<id>/ROLE.md` 再跑 `npm run roster:write` -->
+共 **19** 个角色（现场枚举 `roles/` 下每个目录的 `ROLE.md`）：
+
+`ai-engineer` · `analyst` · `architect` · `backend-engineer` · `ceo` · `content-editor` · `customer-success-manager` · `data-engineer` · `devops-engineer` · `finance` · `frontend-engineer` · `legal` · `marketer` · `product-owner` · `qa` · `reviewer` · `sales` · `security` · `ux-designer`
+
+（这一份是**包内发布面**；本机用户角色根里的角色不列在这里 —— 面板「成员」块里能看到全部）
+<!-- ROSTER:END -->
+
+每个角色干什么，读它自己那份 `team/roles/<id>/ROLE.md` —— 那份是唯一正文，这里不复述。
+
+**包内 19 个默认角色不绑定技能**：`ROLE.md` 里不写 `skills:`；要绑就在面板「角色」的编辑里多选（写进工作区/用户那份副本的 `skills:` 行，包内只读）。没绑时成员首活会如实说「没有常驻的专属技能」，并指向会话里的技能目录，按需载入。
+
+## 角色与技能写在哪 —— 作用域决定"会不会影响别的项目"
+
+宿主原生的技能根按优先级排（本机实测，摘自 DSH 的技能提供方文档）：
+
+| 优先级 | 来源 | 路径 | 作用域 |
+|---|---|---|---|
+| 100 | `project-dsh` | `<项目根>/.dsh/skills` | **只在这个项目里** |
+| 200 | `project-agents` | `<项目根>/.agents/skills` | 只在这个项目里 |
+| 400 | `user-dsh` | `~/.dsh/skills` | **所有工作区共用** |
+
+（角色是**本插件的概念**（宿主不认识它），所以它的根由我们自己定，路径与上面同构：）
+
+| 优先级 | 来源 | 路径 | 作用域 |
+|---|---|---|---|
+| 高 | 工作区角色根 | `<工作区>/.dsh/team-ops/roles/` | **只在这个项目里** |
+| 中 | 用户角色根 | `~/.dsh/team-ops/roles/` | 所有工作区共用 |
+| 低 | 包内 | 插件自带的 `team/roles/` | 随插件发布（升级会覆盖） |
+
+同名时**高处赢**（工作区根 > 用户根 > 包内）。枚举顺序的唯一正文是 `lib/roster.js`。
+
+- **项目内的踩坑总结 / 行为约束** ⇒ 应当落在 **`<项目根>/.dsh/skills`**（只影响那个项目）。
+- **跨项目可复用的作业程序** ⇒ 才落 `~/.dsh/skills`（会影响所有工作区）。
+- **本版起：`skill_define` 默认落项目根**（上文那条偏差已修）—— 缺省 `scope: "workspace"` ⇒ 写 `<项目根>/.dsh/skills`；
+  要落全局（`~/.dsh/skills`，**所有工作区可见**）必须**显式**写 `scope: "user"`。回执里逐字给出"写进了哪个根、是否跨工作区可见"。
+  判据：**项目内的踩坑总结 / 行为约束 ⇒ 缺省**；**跨项目可复用的作业程序 ⇒ 显式 `user`**。
+
+- **角色**：包内那批在插件里（`team/roles/`，升级会整份覆盖）；**你自己加的 / 改的**落在两个可写根之一 ——
+  缺省 **工作区角色根** `<工作区>/.dsh/team-ops/roles/<id>/ROLE.md`（**只影响这个项目**）；
+  要跨项目复用就**显式**选 `scope: "user"`，写 `~/.dsh/team-ops/roles/<id>/ROLE.md`（**所有工作区共用**）。
+  `role_define` 与面板的「添加 / 修改」都走这条作用域，**同名时工作区那份赢**；
+  回执里逐字给出"写进了哪个根、是否跨工作区可见"。
+
+**能写技能 / 角色的只有两条路**（没有自动写入）：**面板**（你点的「新建技能 / 导入技能 / 删除技能」，以及角色的增删改）
+与 **协调器的 `skill_define` / `role_define`**。因此"某个技能是谁加的"今天只能靠**时间戳与 `.bak` 反推** ——
+插件**不记录写入者**；要一眼可查，得加一条"写入留痕"（**尚未做**）。
+
+## 角色包：把你自己建的角色打成一个文件带走
+
+包内那批角色随插件发布，不用打包；**能打包的是你自己建的那部分**（工作区角色根 + 用户角色根）。
+
+- **导出**：面板「成员 → 角色」节头排的「导出」把**全部自建角色**打成一个 `.dshroles.json`
+  下载下来；每张角色卡上那枚「导出」只打包**这一个**。包里除了角色定义，还带上角色 `skills:` 指向的
+  **自建技能**（包内技能不带 —— 对方装了插件就有）。一个自建角色都没有时按钮不可用、**不产空包**。
+- **导入**：同一位置的「导入」选一个包，**先看预览再落盘**：列出每个角色是新的、目标根里已存在、
+  还是会**遮蔽包内同名角色**；再选导入到**本工作区**还是**全局**。
+- **默认不覆盖**：同名已存在就跳过；要覆盖得在预览里显式勾上，覆盖前原文件留一份 `.bak`。
+- **命令行走同一条判定**：
+
+  ```bash
+  npm run role:list                                    # 本机有哪些自建角色 / 自建技能
+  npm run role:export -- --out roles.dshroles.json     # 导出全部（--scope / --role 可缩小范围）
+  npm run role:import -- --in roles.dshroles.json --dry-run   # 先预览
+  npm run role:import -- --in roles.dshroles.json --scope user # 再落盘
+  ```
+
+包的格式（`format` / `formatVersion` / 白名单文件 / 体量上限）与导入的全部判定都在 `lib/role-pack.js`，
+面板与命令行只是它的两个调用方。
+
+## 它不做什么
+
+- **不注册预设、不往技能注册表里加东西**：团队能力随插件装载，跑哪个预设都一样。
+- **不碰 DSH 本体，也不动别人的插件**：所有落盘都在本包与工作区范围内。
+- **不替人做决定**：对外承诺 / 花钱收钱 / 涉及法律效力 / 改变既定方向 —— 这四类一律停下来问人。
+- **不销毁任何会话**：原生名册里的成员只增不减，不用的**不再派活**即可（本插件没有退役 / 删除成员的工具），宿主侧那个子会话仍在。
+
+## 卸载
+
+```bash
+pnpm --dir ~/.dsh/profiles/desktop remove dsh-team-ops   # 再从 dsh.profile.bundles 里去掉这一行
+```
+
+工作区里 `.ops/` 下那几份按用途分：`.ops/human.json`（你说过的判断）、`.ops/roles.json`（角色开关）、`roster.json`（角色下架）、`member-flags.json`（成员停用）是**真源**，删了会丢掉对应状态；`board.json` / `members.json` 是**已废弃的遗留文件**：本插件**不再读它们的内容、也不再写**（`/members` 不再读它们；注入摘要也不以它们的存在判断是不是全新工作区；看板与成员归 DSH 原生 Agent Teams）。**可以直接删**：删掉后 `/members`、`/team-tasks` 照常，`/status` 在原生任务板读不到时回落成"计数读不到"而不是零；`handoff.json` 是**交接快照**（跨会话续接用的派生物）：删了不影响任何实时读数，只是手工看摘要时少那一段交接信息（下一次看板改动会重新写一份）；`checkpoints/` 是**派生**的压缩原始转储，可删。
+
+## 升级（人手动做）
+
+插件是按 **git 依赖**装的（`dsh.profile.bundles` 那一行里写的是仓库地址，不钉 sha），所以升级 = 重新解析依赖：
+
+```bash
+cd ~/.dsh/profiles/desktop
+# ① 常规路：让 pnpm 重新解析
+NODE_TLS_REJECT_UNAUTHORIZED=0 pnpm update dsh-team-ops --config.strict-ssl=false --config.minimumReleaseAge=0
+# ② 上面那条若卡在"别家包的元数据"上（自签证书代理下常见），用这条：
+#    先把 pnpm-lock.yaml 与 node_modules/.modules.yaml 里 dsh-team-ops 的 commit 号换成新 HEAD，再
+NODE_TLS_REJECT_UNAUTHORIZED=0 pnpm install --frozen-lockfile --config.strict-ssl=false --config.minimumReleaseAge=0
+```
+
+**怎么确认升上去了**（不用翻文件）：启动后宿主日志里那一行会印版本号（下面是示例，数字以当时包内 `package.json` 为准）——
+
+```
+team-ops 运行时已装载（v0.24.3）：角色名册 19 个（…）；成员提供方 spawn。
+```
+
+版本号读的是包内 `package.json` 那一格；读不到会**如实印"读不到"**，不会编一个。面板上另有一个版式标记
+（`PANE_MARK`）可作旁证，但它是给"布局对不对"用的，不是版本号。
+
+**升级之后要重启 DSH**：工具与注入的策略段都是**装载时**装配的；技能目录按变更即时刷新，角色清单要重启才更新它那份快照。
+
+## 代码结构与维护
+
+给改这个包的人看的地图（不影响使用方式）：
+
+- **宿主半边**：`lib/board-view.host.js` 是 `cordis.patch.yml` 里唯一指向本包的 loader entry，负责路由常量表、
+  `routeTable()`（路径 → 端点的纯表）、两个引擎的 `apply` 与各端点族的装配。端点按族住在 `lib/*-routes.js`
+  （`team-routes` / `status-routes` / `open-routes` / `role-routes` / `role-pack-routes` /
+  `skill-routes` / `member-write-routes`）；工作区解析、写侧边界、同源判定与遗留账读取在
+  `lib/workspace-io.js`；共享正文分别在 `lib/http-tools.js`（HTTP 编解码）、
+  `lib/ledger-store.js`（账本读-改-写与按文件事务）、`lib/panel-shaping.js`（载荷整形）、
+  `lib/milestones.js`（里程碑解析）、`lib/role-avatar.js`（头像 / 色调 / 分类回落）、
+  `lib/role-text.js`（角色定义文本的解析与构造）、`lib/role-store.js`（角色枚举 / 开关 / 写盘）、
+  `lib/role-persona.js`（persona / 基线路径 / 团队策略段）、`lib/member-engine.js`（默认清单 / 成员工具 /
+  停用与技能剪枝）、`lib/role-skill-tools.js`（`role_define` / `skill_define` 工具）、
+  `lib/role-contract.js`（角色职责契约 / 路径归属冲突）、`lib/collab.js`（交接单 / 任务包检查 / 效率度量）、
+  `lib/collab-routes.js`（`/collab` 只读读数）、
+  `lib/role-record-cache.js`（角色名册读缓存）、`lib/ops-files.js`（`.ops/` 文件名）。
+- **引擎半边**：`team/company-gate.js`（制度层：账本事务、看板与交接快照工具）、
+  `team/team-runtime.js`（运行时层：成员 / 角色 / 技能工具与注入段）——由宿主行自己 apply，不新增 loader entry。
+- **浏览器半边**：宿主以单个 lazy-CJS 工厂投递 `lib/board-view.client.js`，工厂内不能 require 兄弟文件；
+  因此源码按 16 个分区放在 `client-src/*.part`，由 `scripts/build-client.mjs` 字节级拼回发布物。
+  **改界面要改片段再跑 `npm run build:client`**；`npm test` 会钉住片段与生成物逐字节一致，手改生成物会红。
+- **常用命令**：`npm test`（全套行为断言）/ `npm run verify`（语法 + 名册 + 自检）/
+  `npm run build:client`（拼装浏览器半边）/ `npm run bench`（热路径前后对比基准，不做 CI 断言）/
+  `npm run publish:github`（把纯代码树发到 GitHub `main`）。
+
+## 细则在哪
+
+| 想看什么 | 去哪 |
+| --- | --- |
+| 团队规则（怎么派活 / 什么时候问人 / 记账 / 交付物是什么） | `team/BASELINE.md` |
+| 某个角色的职责与作业程序 | `team/roles/<id>/ROLE.md` |
+| 面板端点 / 状态文件 / 浏览器半边各自住在哪 | 上面的「代码结构与维护」 |
+| 为什么这么实现 | `lib/*.js` 与 `team/*.js` 里的注释 |
+| 什么算合格 | `npm test`（判据都是可执行的断言，不是文档里的一句话） |
+| 改动前后性能差多少 | `npm run bench`（同一台机器、同一夹具比中位数） |
