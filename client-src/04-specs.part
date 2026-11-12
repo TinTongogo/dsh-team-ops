@@ -1,0 +1,86 @@
+		// ── ④ 界面规格与配色 ─────────────────────────────────────────────────
+		const BOARD_TONE = {
+			待办: 'neutral',
+			进行中: 'brand',
+			待验收: 'warn',
+			已完成: 'success',
+			已打回: 'error',
+		}
+
+		const SPECS = [
+			{
+				ledger: 'board',
+				label: '任务看板',
+				panelId: 'cbv-panel-board',
+				endpoint: API_PREFIX,
+				// 五档顺序的唯一正文在 `lib/board-status.js`（客户端单文件模块引不到，这一份是抄写，由自检钉住逐字一致）：
+				// 待办 → 进行中 → 待验收 → 已完成 → 已打回。
+				statusOrder: ['待办', '进行中', '待验收', '已完成', '已打回'],
+				statusLabel: (status) => status,
+				tone: (status) => BOARD_TONE[status] || 'neutral',
+				facetField: 'priority',
+				facetAll: '优先级：全部',
+				searchHint: '搜索编号 / 一句话 / owner / 产物',
+			},
+		]
+
+		// ── 面板的块表：成员 / 角色 / 技能 / 任务看板（块序 = 这里的顺序）────────────────
+		// 块序是人的指令：成员最前（默认落成员块）→ 角色（从成员块拆出）→ 技能 → 看板。
+		// 「成员」「角色」「技能」三块不是视图（spec 为 null）：成员=在场的人、角色=现场角色目录、技能=宿主技能目录。
+		// `panelId`：块切换那一排 tab 的 `aria-controls` 要指向对应面板的 id（设计 ⑩ `BLOCKS` 一项）。
+		const MEMBERS_BLOCK = { ledger: 'members', label: '成员', spec: null, panelId: 'cbv-panel-members' }
+		const ROLES_BLOCK = { ledger: 'roles', label: '角色', spec: null, panelId: 'cbv-panel-roles' }
+		const SKILLS_BLOCK = { ledger: 'skills', label: '技能', spec: null, panelId: 'cbv-panel-skills' }
+		const BLOCKS = [MEMBERS_BLOCK, ROLES_BLOCK, SKILLS_BLOCK].concat(SPECS.map((spec) => ({ ledger: spec.ledger, label: spec.label, spec, panelId: spec.panelId })))
+
+		/**
+		 * 复制一段文本到剪贴板：`navigator.clipboard` 优先，取不到就退回复查（临时 textarea + `execCommand`）。
+		 * 两条都失败时**如实回报失败原因**（不假装复制成功：现场那句含糊话已经被打回过一次）。
+		 * @param value - 要复制的文本。
+		 * @returns `{ ok: true }` 或 `{ ok: false, reason }`。
+		 */
+		async function copyText(value) {
+			const text = typeof value === 'string' ? value : String(value ?? '')
+			try {
+				if (typeof navigator !== 'undefined' && navigator.clipboard !== undefined && typeof navigator.clipboard.writeText === 'function') {
+					await navigator.clipboard.writeText(text)
+					return { ok: true }
+				}
+			} catch {
+				/* 落到兜底那条 */
+			}
+			try {
+				const area = document.createElement('textarea')
+				area.value = text
+				area.setAttribute('readonly', 'readonly')
+				area.style.position = 'fixed'
+				area.style.opacity = '0'
+				document.body.appendChild(area)
+				area.select()
+				const copied = document.execCommand !== undefined && document.execCommand('copy')
+				document.body.removeChild(area)
+				return copied ? { ok: true } : { ok: false, reason: '这个环境不允许剪贴板写入（可以手动全选文本复制）' }
+			} catch (error) {
+				return { ok: false, reason: String(error) }
+			}
+		}
+
+		/**
+		 * 客户端**只做形状预检**（设计 4.2.1 / 4.3.2）：角色 id 与技能名都要求小写 kebab-case。
+		 *
+		 * 这只是"别让人点了才收到服务端拒绝"的前置检查；**合法性的唯一正文仍在服务端**
+		 * （`lib/roster.js` 的 `roleIdFindings` / `lib/skill-write.js`），面板不据此下最终结论。
+		 * @param value - 待检查的 id。
+		 * @returns 形状是否可能是合法的。
+		 */
+		const idShapeOk = (value) => /^[a-z][a-z0-9-]*$/.test(text(value).trim())
+
+		const TONE_VAR = {
+			neutral: 'var(--dsw-alias-label-tertiary)',
+			// 圆点那几档：**只给深浅**，不给色相（`a5` 最实 = "这条已经到位"，`a2` 最淡）。
+			brand: 'var(--cbv-a4)',
+			warn: 'var(--cbv-a3)',
+			success: 'var(--cbv-a5)',
+			error: 'var(--cbv-a2)',
+		}
+

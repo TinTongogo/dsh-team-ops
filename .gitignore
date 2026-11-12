@@ -1,0 +1,18 @@
+.DS_Store
+node_modules/
+# 插件状态（人的话 / 角色开关 / 下架 / 交接快照 / 压缩检查点；结构化检查点在 docs/team/checkpoints/，那是要提交的）
+.ops/
+# 文档留档（人的口径）：设计文档 / 团队记录 / 检查点进版本库；pages 里的二进制产物不进。
+docs/*
+!docs/design/
+!docs/design/*.md
+!docs/team/
+!docs/team/checkpoints/
+!docs/team/checkpoints/*.md
+!docs/team/specs/
+!docs/team/specs/*.md
+!docs/team/native-teams.md
+docs/team/pages/
+# 项目级技能根（使用者在工作区里装的技能是你的数据，不进仓库）
+.dsh/
+

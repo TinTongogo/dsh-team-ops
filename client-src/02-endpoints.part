@@ -1,0 +1,83 @@
+		// ── ② 端点与常量 ───────────────────────────────────────────────────
+		const API_PREFIX = '/company-board/api'
+		/** 首屏那三行的端点（与 host half 的 STATUS_PATH 必须一致）。口径同源在引擎的 statusSnapshot。 */
+		const STATUS_ENDPOINT = API_PREFIX + '/status'
+		// 面板的"是哪一版"标记：**只放 data 属性，不挂 title**（挂 title 会在鼠标经过时弹提示，现场明确不要）。
+		// 改形态/观感就换这串字；核对时在 DOM 里看 `data-pane-mark` 即可。
+		// 块序（人的指令，改过四轮，这一版是第四轮）：**成员最前**（打开即落在成员上）→ **角色**
+		// （角色目录从成员块里拆出来，独立成一块）→ **技能** → **任务看板**。
+		const PANE_MARK = 'f114-「角色」选择框 portal 到 body：不再吃输入框那个包含块（修现场错位）'
+		// 量高余量：面板底边与容器底边之间留这么几像素，避免"刚好相等"时因为一个像素的取整误差撑出滚动条。
+		const PANE_HEIGHT_MARGIN = 2
+		/** 打开本地目录（与 host half 的 OPEN_PATH 必须一致）。 */
+		const OPEN_ENDPOINT = API_PREFIX + '/open'
+
+		// ── 「成员」块：与 host 的成员读路径一致 ────────────────────────────────────────
+		// 只有读：成员栏与会话工具 `member_list` 同一份判定；成员是宿主原生的队友，本插件不改 / 不删 / 不启停
+		// （host 那两条写路由保留为防御性拒绝，直接 POST 也拿不到改动）。
+		const MEMBERS_ENDPOINT = API_PREFIX + '/members'
+		/** 「角色」那三条写路径（增删改）。端点常量与 host half 的常量逐字对齐（有自检）。 */
+		const ROLES_UPDATE_ENDPOINT = API_PREFIX + '/roles/update'
+		const ROLES_REMOVE_ENDPOINT = API_PREFIX + '/roles/remove'
+		const ROLES_RESTORE_ENDPOINT = API_PREFIX + '/roles/restore'
+		/** 角色包两条路：导出（GET）/ 导入（POST，先 preview 再落盘）。与 host half 的常量逐字对齐（有自检）。 */
+		const ROLES_EXPORT_ENDPOINT = API_PREFIX + '/roles/export'
+		const ROLES_IMPORT_ENDPOINT = API_PREFIX + '/roles/import'
+		// 成员那三个动词（HD-006）：**服务端给动词、客户端不猜** —— 卡上给哪几个按钮看载荷里的 `verbs`。
+		const MEMBERS_DISABLE_ENDPOINT = MEMBERS_ENDPOINT + '/disable'
+		const MEMBERS_RESTORE_ENDPOINT = MEMBERS_ENDPOINT + '/restore'
+		const MEMBERS_INTERRUPT_ENDPOINT = MEMBERS_ENDPOINT + '/interrupt'
+		/** 团队服务那一层的查 / 开 / 关（与 host half 的 TEAM_SERVICE_PATH 逐字对齐）。 */
+		const TEAM_SERVICE_ENDPOINT = API_PREFIX + '/team-service'
+
+		// ── 「技能」块：与 host 的 SKILLS_PATH / SKILL_DEFINITION_PATH 一致 ──────────────
+		// 清单与正文不自己读盘：host 转发给宿主技能注册表（`ctx.skills`，DSH 会加载哪些技能的唯一正文）；只读。
+		const TEAM_TASKS_ENDPOINT = API_PREFIX + '/team-tasks'
+		// 协作读数（任务三态 / 交接单 / 冲突 / 任务包缺格）；只读，面板「任务看板」块顶部那一行。
+		const COLLAB_ENDPOINT = API_PREFIX + '/collab'
+
+		const SKILLS_ENDPOINT = API_PREFIX + '/skills'
+		const SKILL_DEFINITION_ENDPOINT = SKILLS_ENDPOINT + '/definition'
+		// 技能块的三个**写入口**（导入 / 新建 / 删除）。判定与落盘全在宿主那侧（`lib/skill-write.js`），
+		// 面板只做"取参数、POST、把回执原文摆出来"。
+		const SKILLS_IMPORT_ENDPOINT = SKILLS_ENDPOINT + '/import'
+		const SKILLS_CREATE_ENDPOINT = SKILLS_ENDPOINT + '/create'
+		const SKILLS_REMOVE_ENDPOINT = SKILLS_ENDPOINT + '/remove'
+		/**
+		 * 输入框润色（design-polish-001）：**POST**，body `{ session, text }`。
+		 * 与 host half 的 `POLISH_PATH` 逐字对齐（`/company-board/api/polish`）；
+		 * 200 回 `{ ok:true, polished, language, scenario, changes, confidence, checks, route, elapsedMs, cached }`，
+		 * 非 200 回 `{ ok:false, error, reason? }`（400/409/429/502/504）。
+		 */
+		const POLISH_ENDPOINT = API_PREFIX + '/polish'
+		/**
+		 * 哪几类来源**可写**（键 = 宿主给的 `source`，值 = 写入口的 `root`）。
+		 *
+		 * 只认这两类：`user-dsh`（`~/.dsh/skills`）与 `project-dsh`（`<工作区>/.dsh/skills`）。
+		 * `bundled`（随安装发布）与 `user-agents` / `project-agents`（别的 agent 的根）**只读** ——
+		 * 面板对它们不画写动作，写入口那侧也会拒（两处同一口径）。
+		 */
+		const WRITABLE_SKILL_SOURCES = { 'user-dsh': 'user', 'project-dsh': 'project' }
+		// 导入的两条上限，与宿主 `lib/skill-write.js` 里那两条**同一套**（面板先自检，别让人看到网络错误）：
+		// 文件总数 500、内容总量 4 MB（base64 上传会膨胀约三分之一，宿主那条请求体上限是 8 MB）。
+		const SKILL_IMPORT_MAX_FILES = 500
+		const SKILL_IMPORT_MAX_BYTES = 4 * 1024 * 1024
+		/**
+		 * 视图栏那几个读端点共用的查询串：`workspace`（**哪个工作区**）与 `session`（**哪个会话**）。
+		 *
+		 * `session` 不是可选的装饰：
+		 *   · 成员那一块要靠它拿**本会话的 agent 名册**（`ctx.agentTeams.listMembers` 要一个活着的队内
+		 *     agent 当凭据，而"这个会话的 Lead"只能按会话 id 取）；
+		 *   · 技能那一块要靠它读**会话那一层**的目录（不带就只能读全局层，那不是模型看到的那份）。
+		 * 缺哪个就不带哪个 —— 宿主那边会把"没带"说成"读不到"，而不是猜一个。
+		 */
+		/**
+		 * 面板几个读端点的**短 TTL 缓存**。
+		 *
+		 * 为什么需要：端点本身只要 1–4 ms（现场量过），但组件是**按会话 / 按块重挂**的 ⇒
+		 * 每次重挂都重新发一遍请求，人就得等一个来回（切会话时还得先等会话 id 落定）。这一层做到两件事：
+		 *   · 同一个 key 在 TTL 内只发一次 ⇒ **切块几乎瞬间出内容**；
+		 *   · 配合下面的 `prefetchPanes()`（切会话时并行预取四个端点）⇒ 切过去那一刻就已经在拉了。
+		 * 写动作（加成员 / 删角色 / 导入技能…）与刷新 tick 之后**必须失效**（见 `invalidatePanes()`），
+		 * 否则人点完看到的还是旧的。
+		 */

@@ -1,0 +1,797 @@
+		// ── ⑬ 角色块 ─────────────────────────────────────────────────────
+		/**
+		 * 「角色」块：本机现场枚举的角色目录（包内 / 用户根 / 项目根）。
+		 *
+		 * 人的指令：原来挂在「成员」卡区下面那一整节**拆出来独立成一块** —— 这一块只画角色目录：
+		 * 来源筛选、角色卡（修改 / 导出这一个 / 下架 · 删除 · 恢复）、
+		 * 「导出」「导入」「＋ 添加角色」、未建立提示、已下架行、添加 / 修改弹窗与角色包弹窗。
+		 * **成员是另一块**（成员卡、筛选、那三个动词），两块不再挤在同一个滚动区里。
+		 *
+		 * 数据与「成员」块**同一份**：`/members` 载荷里的 `defaults`（引擎 `defaultRosterOf` ——
+		 * 与会话工具 `member_defaults` 同一个函数），读取走同一个缓存出口（`getJsonCached`，
+		 * 两块共用 TTL）⇒ 切块不会为同一份载荷多付一次等待；`skillOptions` 也在同一份载荷里
+		 * （专属技能多选的候选）。
+		 * @param props - `sessions` 取当前会话（工作区与角色根都跟着它）；
+		 *   `reload` 是面板的重读计数（切块 / 窗口回到前台 / 面板重新可见时 +1）。
+		 */
+		function RolesView(props) {
+			const store = props.sessions === undefined ? null : typeof props.sessions === 'function' ? props.sessions() : props.sessions
+			const workspace = useCurrentWorkspace(store)
+			// 会话 id 必须带上：角色根按会话解析（`?session=`），少了它宿主只能按全局层回落。
+			// 子智能体对话里点开面板时，折到**根会话**（角色目录与技能候选跟着领队那一份）。
+			const sessionId = useCurrentSessionId(store)
+			const teamSessionId = teamSessionIdOf(store, sessionId)
+			// 等权威会话：初次挂载拿不到 `uiSession.current` 时会落到旧会话（读出来是「不活着」）。
+			const ready = useSessionAuthority()
+			const target = ready ? membersUrlOf(workspace, teamSessionId) : ''
+			const [snapshot, setSnapshot] = React.useState({ phase: 'loading' })
+			// 本块自己的重读计数：角色那几类写动作（增删改 / 恢复 / 导入）之后重取这一块。
+			const [localTick, setLocalTick] = React.useState(0)
+			// 「角色」这一块的**来源筛档**（null = 全部）：档位与标签都来自载荷。
+			const [rosterOriginFacet, setRosterOriginFacet] = React.useState(null)
+			// 那三个动作（添加 / 修改 / 删或下架）各自的形状：**同时只可能开一个**。
+			const [rosterDialog, setRosterDialog] = React.useState(null)
+			const [rosterDraft, setRosterDraft] = React.useState({ id: '', title: '', category: '', positioning: '', body: '', skills: '' })
+			// 「专属技能」那个**多选下拉**是否展开（收起时也要看得出选了哪些 ⇒ 摘要那一行）
+			const [skillsOpen, setSkillsOpen] = React.useState(false)
+			const [rosterBusy, setRosterBusy] = React.useState(null)
+			const [rosterNotice, setRosterNotice] = React.useState(null)
+			/** 角色包导入的预览窗：`null` = 没开；开着时带包文本、预览结论与两个选择。 */
+			const [packDialog, setPackDialog] = React.useState(null)
+			// 浮窗内的错误（设计 ⑥.3：失败时浮窗不关，错误显示在浮窗内）：角色表单 / 删除确认各一条。
+			const [rosterError, setRosterError] = React.useState('')
+			// 防重复提交的同步闸（state 在同一轮里还没更新，只有 ref 顶得住两次点击）。
+			const busyRef = React.useRef(false)
+			const showSkeleton = useSkeletonVisible(snapshot.phase === 'loading')
+			// 浮窗可达性：Esc 关、Tab 圈闭、打开时聚焦、关闭归还焦点（与详情浮窗共用 `useModalA11y`）。
+			const rosterModalRef = useModalA11y(rosterDialog !== null && text(rosterDialog.kind) !== 'remove', () => {
+				if (rosterBusy === null) setRosterDialog(null)
+			})
+			const packModalRef = useModalA11y(packDialog !== null, () => setPackDialog(null))
+			const active = props.active !== false
+
+			React.useEffect(() => {
+				if (!active || !ready) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setSnapshot({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				getJsonCached(target)
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null) {
+							setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: 'HTTP ' + response.status + '：响应不是 JSON' }))
+							return
+						}
+						if (payload.ok === true) {
+							setSnapshot({ phase: 'ready', data: payload })
+							return
+						}
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }))
+					})
+					.catch((error) => {
+						if (cancelled) return
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: '' + error }))
+					})
+				return () => {
+					cancelled = true
+				}
+				// props.reload：面板的重读计数；localTick：角色那几个写动作之后自己重取；active：只有当前块取数。
+			}, [props.reload, localTick, target, active, ready])
+
+			const data = snapshot.phase === 'ready' ? snapshot.data : null
+
+			/** 读失败时那一枚「重读」（与成员块同一条口径：可恢复的失败要有个能再试的入口）。 */
+			const retry = () => {
+				invalidatePanes()
+				setLocalTick((value) => value + 1)
+			}
+
+			/**
+			 * 角色这几只弹窗共用的外壳：遮罩 + 标题 + 右上角动作区 + 正文。
+			 *
+			 * 复用详情浮窗那两个类名（`.cbv-overlay` / `.cbv-modal`）：观感与既有的详情窗一致，
+			 * 语法上也只是"同一套标记的又一个用处"。
+			 * **遮罩点击沿用搬移前的实际行为：不关** —— 搬移前它清的是「成员」弹窗那格 state，
+			 * 而成员弹窗早已随成员写面撤掉（点它等于什么也没发生）。这里把这件事写明，
+			 * 不再借别人那格 state 表达；关窗仍然只有「取消 / 提交」。
+			 */
+			const shellOf = (title, actions, bodyNode, { narrow = false, onOverlay = () => {}, modalRef = null } = {}) =>
+				el(
+					'div',
+					{ className: 'cbv-overlay', key: 'overlay', onClick: onOverlay },
+					el(
+						'div',
+						{ className: 'cbv-modal cbv-modal--members' + (narrow ? ' cbv-modal--narrow' : ''), onClick: (event) => event.stopPropagation(), role: 'dialog', 'aria-modal': 'true', 'aria-label': title, ref: modalRef, tabIndex: -1, 'data-members-dialog': title, 'data-roles-dialog': title },
+						el(
+							'div',
+							{ className: 'cbv-modal-head', key: 'head' },
+							el('span', { className: 'cbv-modal-title', key: 'title' }, title),
+							el('div', { className: 'cbv-modal-actions', key: 'actions' }, actions),
+						),
+						el('div', { className: 'cbv-modal-body', key: 'body' }, bodyNode),
+					),
+				)
+
+			/**
+			 * 「角色」那三个动作的**写流程**（POST → 原样显示引擎的结论 → 重取）。
+			 *
+			 * 端点三条（与 host half 常量逐字对齐，有自检）：`/roles/update`（添加 / 修改）、
+			 * `/roles/remove`（删或下架）、`/roles/restore`（恢复上架）。
+			 * **不猜语义**：回执里那几句（`mode` / `promptRoster` / `promptRosterNote` / 引擎的拒绝理由）
+			 * 原样转达 —— "包内角色只能下架"由引擎说，面板不另写一份说辞。引擎那两个字段说的是
+			 * **注入到系统提示里那份「可叫的队友」清单**这颗快照旧了（`'stale'`），**不是**工具面不能用：
+			 * `member_defaults` / `member_spawn` 现枚举，建完立刻能用。（字段从前叫 `restartRequired`，
+			 * 名字本身把"能不能用"挂在重启上，已改名。）
+			 * **角色这一面是活的**（人的判断只撤成员那一面）：`handleRoleWrite` 真写用户角色根。
+			 */
+
+			const postRoster = (url, body, after, opts) => {
+				const options = opts === undefined || opts === null ? {} : opts
+				if (busyRef.current) return
+				busyRef.current = true
+				if (typeof fetch !== 'function') {
+					busyRef.current = false
+					if (typeof options.onFailure === 'function') options.onFailure('当前环境没有 fetch')
+					else setRosterNotice({ tone: 'error', lines: ['当前环境没有 fetch'] })
+					return
+				}
+				setRosterBusy(url)
+				setRosterError('')
+				setRosterNotice(null)
+				// **同一套拼法**（`paneQueryOf`）：宿主拿不到工作区时会**按会话**回落 —— 手拼那一版只带 workspace。
+				fetch(url + paneQueryOf(workspace, teamSessionId), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify(body),
+				})
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						busyRef.current = false
+						setRosterBusy(null)
+						if (payload !== null && payload.ok === true) {
+							setRosterNotice({ tone: 'ok', lines: after(payload) })
+							// 写完立刻重取（`localTick` 就是这一块自己的重取计数，与成员那几个动作同一处）。
+							invalidatePanes()
+							setLocalTick((value) => value + 1)
+							if (typeof options.onSuccess === 'function') options.onSuccess(payload)
+							return
+						}
+						const line = payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status
+						// **失败不关窗**（设计 ⑥.3）：浮窗类错误留在浮窗内；块内动作给块顶回执 + 重试。
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(line)
+							return
+						}
+						setRosterNotice({ tone: 'error', lines: [line], retry: () => postRoster(url, body, after, options) })
+					})
+					.catch((error) => {
+						busyRef.current = false
+						setRosterBusy(null)
+						const line = '请求失败：' + (error === null || error === undefined ? '未知错误' : String(error.message ?? error))
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(line)
+							return
+						}
+						setRosterNotice({ tone: 'error', lines: [line], retry: () => postRoster(url, body, after, options) })
+					})
+			}
+
+			/** 下架：一个动作，没有确认浮窗（人的口径；不删文件、可恢复）。 */
+			const postRosterHide = (entry) => {
+				postRoster(
+					ROLES_REMOVE_ENDPOINT,
+					{ role: text(entry.role) },
+					(payload) => ['已下架：' + text(payload.role), ...(Array.isArray(payload.warnings) ? payload.warnings : [])],
+					{ onFailure: (line) => setRosterNotice({ tone: 'error', lines: [line], retry: () => postRosterHide(entry) }) },
+				)
+			}
+
+			/** 恢复上架：一个动作，没有弹窗（不删任何东西，可再来一次）。 */
+			const postRosterRestore = (entry) => {
+				postRoster(
+					ROLES_RESTORE_ENDPOINT,
+					{ role: text(entry.role) },
+					(payload) => [`已恢复上架：${text(entry.role)}`, ...(Array.isArray(payload.warnings) ? payload.warnings : [])],
+					{ onFailure: (line) => setRosterNotice({ tone: 'error', lines: [line], retry: () => postRosterRestore(entry) }) },
+				)
+			}
+
+			/**
+			 * 浮窗里的一行说明（`.cbv-mp-field-note` + markdown）：**一处实现**，
+			 * 免得每个说明各写一遍 `el('div', …)`；带 `**` 的说明也不会再被当字面量印出来。
+			 * @param value - 说明文本（可含 markdown 的行内标记）。
+			 * @param key - React key。
+			 * @returns 节点。
+			 */
+			const note = (value, key) =>
+				el('div', { className: 'cbv-mp-field-note cbv-md', key: key }, markdownNodes(value, 'note-' + key))
+
+			/** 三个动作共用的弹窗（形态与成员那两个弹窗同款）。 */
+			/** 那一格存的是**逗号分隔的字符串**（与 `patchRoleText` 的契约一致）：拆/拼都只有这一处。 */
+			/** 多选下拉**收起时**那一行摘要（空则写「未选」；多了就报个数 + 前几个名字）。 */
+			const skillSummaryOf = (names) => (names.length === 0 ? '未选（这个角色没有专属技能）' : names.length <= 3 ? `已选 ${names.length}：${names.join('、')}` : `已选 ${names.length}：${names.slice(0, 3).join('、')} 等`)
+			const skillSelected = (value) =>
+				text(value)
+					.split(',')
+					.map((name) => name.trim())
+					.filter((name) => name !== '')
+			const skillToggle = (value, name) => {
+				const now = skillSelected(value)
+				const next = now.indexOf(name) === -1 ? [...now, name] : now.filter((item) => item !== name)
+				return next.join(', ')
+			}
+			// ── 角色包：导出 / 导入 ────────────────────────────────────────────────────────
+			// 判定全在宿主（`lib/role-pack.js`）：包格式、id、越界、冲突；面板只负责存文件、请求预览、发作用域/冲突、摆回执。
+			/** 导出回执（两个入口共用）：把回执印在「角色」那一节的回执行里。 */
+			const savePack = (fileName, pack) => {
+				try {
+					const blob = new Blob([JSON.stringify(pack, null, 2) + '\n'], { type: 'application/json' })
+					const url = URL.createObjectURL(blob)
+					const anchor = document.createElement('a')
+					anchor.href = url
+					anchor.download = fileName
+					document.body.appendChild(anchor)
+					anchor.click()
+					document.body.removeChild(anchor)
+					// 立刻 revoke 会让部分浏览器取消下载：等一会儿再回收。
+					setTimeout(() => URL.revokeObjectURL(url), 4000)
+					const roles = Array.isArray(pack?.roles) ? pack.roles.map((role) => text(role.id)) : []
+					const skills = Array.isArray(pack?.skills) ? pack.skills.map((skill) => text(skill.name)) : []
+					setRosterNotice({
+						tone: 'ok',
+						lines: [
+							`已导出 ${roles.length} 个角色：${roles.join('、')}${skills.length > 0 ? `（随包技能 ${skills.length} 个：${skills.join('、')}）` : ''}`,
+							`文件名：${fileName}`,
+						],
+					})
+				} catch (error) {
+					setRosterNotice({ tone: 'error', lines: ['导出失败：' + String(error !== null && typeof error === 'object' ? (error.message ?? error) : error)] })
+				}
+			}
+			/** 导出：`role` 给了就是"导出这一个"，不给就是"全部自建角色"。 */
+			const exportRoles = (role) => {
+				if (typeof fetch !== 'function') {
+					setRosterNotice({ tone: 'error', lines: ['当前环境没有 fetch'] })
+					return
+				}
+				setRosterNotice(null)
+				const extra = paneQueryOf(workspace, teamSessionId)
+				const query = '?scope=all' + (text(role) === '' ? '' : '&role=' + encodeURIComponent(text(role))) + (extra === '' ? '' : '&' + extra.slice(1))
+				// 读端点一律走那个**唯一的取数出口**（`getJsonCached`）：导出每次都要最新的现场，
+				// 所以带 `force: true` —— 走同一个出口，只是不吃缓存。
+				getJsonCached(ROLES_EXPORT_ENDPOINT + query, { force: true })
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (payload !== null && payload.ok === true && payload.pack !== undefined) {
+							savePack(text(payload.fileName) === '' ? 'roles.dshroles.json' : text(payload.fileName), payload.pack)
+							return
+						}
+						setRosterNotice({ tone: 'error', lines: [payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status] })
+					})
+					.catch((error) => setRosterNotice({ tone: 'error', lines: ['请求失败：' + String(error !== null && typeof error === 'object' ? (error.message ?? error) : error)] }))
+			}
+			/** 导入第一步（预览）：把包文本发上去，宿主回"哪些是新的 / 已存在 / 会遮蔽包内角色"。 */
+			const previewPack = (textValue, fileName, scope, onConflict) => {
+				const nextScope = scope === 'user' ? 'user' : 'workspace'
+				const nextConflict = onConflict === 'overwrite' ? 'overwrite' : 'skip'
+				setRosterNotice(null)
+				setPackDialog({ text: textValue, fileName, scope: nextScope, onConflict: nextConflict, plan: null, busy: true, error: '' })
+				if (typeof fetch !== 'function') {
+					setPackDialog((current) => (current === null ? current : { ...current, busy: false, error: '当前环境没有 fetch' }))
+					return
+				}
+				fetch(ROLES_IMPORT_ENDPOINT + paneQueryOf(workspace, teamSessionId), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ pack: textValue, scope: nextScope, onConflict: nextConflict, preview: true }),
+				})
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (payload !== null && payload.ok === true) {
+							setPackDialog((current) => (current === null ? current : { ...current, busy: false, plan: payload.plan, error: '' }))
+							return
+						}
+						setPackDialog((current) => (current === null ? current : { ...current, busy: false, plan: null, error: payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }))
+					})
+					.catch((error) => setPackDialog((current) => (current === null ? current : { ...current, busy: false, error: '请求失败：' + String(error !== null && typeof error === 'object' ? (error.message ?? error) : error) })))
+			}
+			/** 导入入口：开一个文件选择框（只收 JSON）。 */
+			const pickPackForImport = () => {
+				if (typeof document === 'undefined' || document === null || typeof document.createElement !== 'function') {
+					setRosterNotice({ tone: 'error', lines: ['这个环境不给开文件选择框；请把包内容贴进会话。'] })
+					return
+				}
+				try {
+					const input = document.createElement('input')
+					input.type = 'file'
+					input.accept = '.json,application/json'
+					input.onchange = () => {
+						const file = input.files === null || input.files === undefined ? undefined : input.files[0]
+						if (file === undefined) return
+						// 客户端先做**大小检查**（与服务端 12 MB 上限同一套）：> 12 MB 直接拒绝并说明，不发请求。
+						if (typeof file.size === 'number' && file.size > 12 * 1024 * 1024) {
+							setRosterNotice({ tone: 'error', lines: ['这个包超过 12 MB（服务端上限），没有读取。拆成两个包再导入。'] })
+							return
+						}
+						void file.text().then((content) => previewPack(content, file.name, 'workspace', 'skip'))
+					}
+					input.click()
+				} catch (error) {
+					setRosterNotice({ tone: 'error', lines: ['开不了文件选择框：' + String(error !== null && typeof error === 'object' ? (error.message ?? error) : error)] })
+				}
+			}
+			/** 导入第二步（落盘）：按预览时选的作用域与冲突策略提交。 */
+			const submitPack = () => {
+				if (packDialog === null || packDialog.busy === true) return
+				setPackDialog((current) => (current === null ? current : { ...current, busy: true, error: '' }))
+				fetch(ROLES_IMPORT_ENDPOINT + paneQueryOf(workspace, teamSessionId), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ pack: packDialog.text, scope: packDialog.scope, onConflict: packDialog.onConflict }),
+				})
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (payload !== null && payload.ok === true) {
+							const line = (list) => list.map((entry) => `${entry.kind === 'role' ? '角色' : '技能'} ${entry.id}`).join('、')
+							const lines = [
+								`已导入到${payload.scope === 'user' ? '用户级' : '项目级'}：${payload.roleRoot}`,
+								`写入 ${payload.imported.length}：${line(payload.imported) || '（无）'}`,
+							]
+							if (payload.overwritten.length > 0) lines.push(`覆盖 ${payload.overwritten.length}：${line(payload.overwritten)}（原文件已留 .bak）`)
+							if (payload.skipped.length > 0) lines.push(`跳过 ${payload.skipped.length}：` + payload.skipped.map((entry) => `${entry.id}（${entry.reason}）`).join('；'))
+							setRosterNotice({ tone: 'ok', lines })
+							setPackDialog(null)
+							invalidatePanes()
+							setLocalTick((value) => value + 1)
+							return
+						}
+						setPackDialog((current) => (current === null ? current : { ...current, busy: false, error: payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }))
+					})
+					.catch((error) => setPackDialog((current) => (current === null ? current : { ...current, busy: false, error: '请求失败：' + String(error !== null && typeof error === 'object' ? (error.message ?? error) : error) })))
+			}
+			/** 导入预览窗（先看清单与冲突，再点导入）。 */
+			const packDialogOf = () => {
+				const plan = packDialog.plan
+				const busyNow = packDialog.busy === true
+				const marked = (planRole) =>
+					[planRole.status === 'exists' ? '目标根里已存在' : '新', planRole.shadowsPackage === true ? '**会遮蔽包内同名角色**' : '', planRole.otherScopeExists === true ? '另一作用域已有同名' : '']
+						.filter((value) => value !== '')
+						.join(' · ')
+				return shellOf(
+					'导入角色包',
+					[
+						el('button', { className: 'cbv-btn', key: 'cancel', type: 'button', 'data-autofocus': '', disabled: busyNow, onClick: () => setPackDialog(null) }, '取消'),
+						el('button', { className: 'cbv-btn', key: 'go', type: 'button', disabled: busyNow || plan === null, 'data-pack-submit': '', onClick: submitPack }, busyNow ? '处理中…' : '导入'),
+					],
+					[
+						note(`包：${packDialog.fileName}`, 'pack-file'),
+						el(
+							'div',
+							{ className: 'cbv-mp-field', key: 'scope' },
+							el('div', { className: 'cbv-mp-field-label' }, '导入到'),
+							el(
+								'select',
+								{
+									className: 'cbv-select',
+									'data-pack-field': 'scope',
+									value: packDialog.scope,
+									disabled: busyNow,
+									onChange: (event) => previewPack(packDialog.text, packDialog.fileName, event.target.value, packDialog.onConflict),
+								},
+								el('option', { value: 'workspace', key: 'workspace' }, '本工作区（缺省）'),
+								el('option', { value: 'user', key: 'user' }, '全局（所有工作区都看得见）'),
+							),
+							note('角色与它引用的技能落在同一作用域。', 'pack-scope-note'),
+						),
+						el(
+							'label',
+							{ className: 'cbv-skill-choice', key: 'overwrite', 'data-pack-field': 'overwrite' },
+							el('input', {
+								type: 'checkbox',
+								checked: packDialog.onConflict === 'overwrite',
+								disabled: busyNow,
+								onChange: (event) => previewPack(packDialog.text, packDialog.fileName, packDialog.scope, event.target.checked ? 'overwrite' : 'skip'),
+							}),
+							'覆盖已存在的同名角色/技能（覆盖前留一份 .bak）',
+						),
+						packDialog.error === ''
+							? null
+							: el('div', { className: 'cbv-mp-field-note', key: 'pack-error' }, packDialog.error),
+						busyNow && plan === null
+							? el('div', { className: 'cbv-mp-field-note', key: 'pack-busy' }, '正在读这个包…')
+							: null,
+						plan === null
+							? null
+							: el(
+									'div',
+									{ key: 'plan', 'data-pack-plan': '' },
+									note(`角色 ${plan.counts.roles} 个（新 ${plan.counts.rolesNew} / 已存在 ${plan.counts.rolesExisting}${plan.counts.rolesShadowingPackage > 0 ? ` / 会遮蔽包内 ${plan.counts.rolesShadowingPackage}` : ''}）；技能 ${plan.skills.length} 个`, 'pack-counts'),
+									...plan.roles.map((planRole) => el('div', { className: 'cbv-sub', key: 'r-' + planRole.id, 'data-pack-role': planRole.id }, `${planRole.id} —— ${marked(planRole)}`)),
+									...plan.skills.map((planSkill) => el('div', { className: 'cbv-sub', key: 's-' + planSkill.name, 'data-pack-skill': planSkill.name }, `技能 ${planSkill.name} —— ${planSkill.status === 'exists' ? '目标根里已存在' : '新'}`)),
+								),
+					],
+					{ modalRef: packModalRef },
+				)
+			}
+			const rosterDialogOf = () => {
+				const kind = rosterDialog.kind
+				const draft = rosterDraft
+				// **多选那一格的候选**：当前能真实载入的（载荷 `skillOptions`，会话作用域）
+				// ∪ 这个角色**已声明的**（本机此刻没有的仍列出来、标「(本机没有)」—— 会话目录会漂移，静默丢就是丢数据）。
+				const skillChoices = (() => {
+					const listed =
+						data !== null && data !== undefined && data.skillOptions !== null && data.skillOptions !== undefined && Array.isArray(data.skillOptions.names)
+							? data.skillOptions.names.map((name) => text(name))
+							: []
+					const out = listed.filter((name) => name !== '').map((name) => ({ name, present: true }))
+					for (const name of skillSelected(draft.skills)) {
+						if (name !== '' && !out.some((choice) => choice.name === name)) out.push({ name, present: false })
+					}
+					return out
+				})()
+				const head = kind === 'create' ? '添加角色' : kind === 'edit' ? `修改角色：${text(rosterDialog.entry.role)}` : text(rosterDialog.entry.removal) === 'hide' ? `下架角色：${text(rosterDialog.entry.role)}` : text(rosterDialog.entry.removal) === 'revert' ? `还原为包内：${text(rosterDialog.entry.role)}` : `删除角色：${text(rosterDialog.entry.role)}`
+				const busyNow = rosterBusy !== null
+				// 只做**形状预检**（设计 4.2.1）：合法性仍由服务端判（共用 `idShapeOk`）。
+				const canSubmit = kind === 'remove' ? true : kind === 'create' ? idShapeOk(draft.id) : true
+				const submit = () => {
+					if (kind === 'create' || kind === 'edit') {
+						if (kind === 'create' && !idShapeOk(draft.id)) {
+							setRosterError('角色 id 要匹配 ^[a-z][a-z0-9-]*$（小写字母开头，只含小写字母、数字与单个连字符）。')
+							return
+						}
+						// 修改：空字段 = 不动（服务端语义）；专属技能清空 = 删除 `skills:` 行（允许）。
+						const body = {
+							...(kind === 'create' ? { id: draft.id.trim() } : { role: text(rosterDialog.entry.role) }),
+							title: draft.title.trim(),
+							category: draft.category.trim(),
+							positioning: draft.positioning.trim(),
+							skills: draft.skills.trim(),
+							scope: draft.scope,
+							...(draft.body.trim() === '' ? {} : { body: draft.body }),
+						}
+						postRoster(
+							ROLES_UPDATE_ENDPOINT,
+							body,
+							(payload) =>
+								kind === 'create'
+									? [`已添加角色 ${payload.role}：${payload.file}`, '工具面立刻可用；系统提示里那份队友清单要重启才更新（不影响叫人）。']
+									: [`已改 ${payload.role}：${payload.file}`],
+							{ onSuccess: () => setRosterDialog(null), onFailure: (line) => setRosterError(line) },
+						)
+						return
+					}
+					// 下架 / 删除 / 还原：确认浮窗里点完才走到这里（`runRemoveConfirm`）。
+				}
+				return shellOf(
+					head,
+					[
+						el('button', { className: 'cbv-btn', key: 'cancel', type: 'button', disabled: busyNow, onClick: () => setRosterDialog(null) }, '取消'),
+						el(
+							'button',
+							{
+								className: 'cbv-btn ' + (kind === 'remove' ? 'cbv-btn--bad' : ''),
+								key: 'go',
+								type: 'button',
+								disabled: busyNow || canSubmit !== true,
+								// 动词化（设计 6.2）：主按钮写清会发生什么，不用「确定」。
+								'data-roster-submit': kind,
+								onClick: submit,
+							},
+							busyNow ? '提交中…' : kind === 'create' ? '添加' : kind === 'edit' ? '保存' : text(rosterDialog.entry.removal) === 'hide' ? '下架' : text(rosterDialog.entry.removal) === 'revert' ? '还原' : '删除角色',
+						),
+					],
+					kind === 'remove'
+						? [
+								note(text(rosterDialog.entry.removal) === 'hide' ? '下架：本工作区不再列它，可恢复。' : text(rosterDialog.entry.removal) === 'revert' ? '还原：删掉用户根里的同名覆盖。' : '真删：删除用户角色根里这个目录。'),
+							]
+						: [
+								// 六格**同形**：标签一行、控件一行、说明一行（说明走 `.cbv-mp-field-note` + markdown，
+								// 与成员弹窗那两处同一套；`**` 不再被当字面量印出来）。
+								kind === 'create'
+									? el(
+											'div',
+											{ className: 'cbv-mp-field', key: 'id' },
+											el('div', { className: 'cbv-mp-field-label' }, '角色 id'),
+											el('input', { className: 'cbv-input', 'data-autofocus': '', 'data-roster-field': 'id', value: draft.id, onChange: (event) => setRosterDraft((current) => ({ ...current, id: event.target.value })), placeholder: '例如 data-label' }),
+											note('小写 kebab-case。', 'id-note'),
+										)
+									: null,
+								el(
+									'div',
+									{ className: 'cbv-mp-field', key: 'title' },
+									el('div', { className: 'cbv-mp-field-label' }, '显示名'),
+									el('input', { className: 'cbv-input', ...(kind === 'edit' ? { 'data-autofocus': '' } : {}), 'data-roster-field': 'title', value: draft.title, onChange: (event) => setRosterDraft((current) => ({ ...current, title: event.target.value })), placeholder: kind === 'edit' ? '（空＝这一格不动）' : '例如 数据标注' }),
+									note('清单上那一格', 'title-note'),
+								),
+								// **作用域**（HD-008）：缺省"本工作区"；"全局"必须人显式点 —— 判据写在下面那行说明里。
+								el(
+									'div',
+									{ className: 'cbv-mp-field', key: 'scope' },
+									el('div', { className: 'cbv-mp-field-label' }, '写在哪'),
+									// **下拉**（人的追加要求：圆点改列表；选项文字与说明沿用）
+									el(
+										'select',
+										{
+											className: 'cbv-select',
+											'data-roster-field': 'scope',
+											value: draft.scope,
+											onChange: (event) => setRosterDraft((current) => ({ ...current, scope: event.target.value })),
+										},
+										el('option', { value: 'workspace', key: 'workspace' }, '本工作区（缺省）'),
+										el('option', { value: 'user', key: 'user' }, '全局（所有工作区都看得见）'),
+									),
+									note('项目专属选本工作区；跨项目复用才选全局。', 'scope-note'),
+								),
+								el(
+									'div',
+									{ className: 'cbv-mp-field', key: 'category' },
+									el('div', { className: 'cbv-mp-field-label' }, '分类'),
+									el('input', { className: 'cbv-input', 'data-roster-field': 'category', value: draft.category, onChange: (event) => setRosterDraft((current) => ({ ...current, category: event.target.value })), placeholder: kind === 'edit' ? '（空＝这一格不动）' : '例如 数据 / 研发 / 质量' }),
+									note('看板上那一枚小字，任意词。', 'category-note'),
+								),
+								el(
+									'div',
+									{ className: 'cbv-mp-field', key: 'skills' },
+									el('div', { className: 'cbv-mp-field-label' }, '专属技能（可选，多选）'),
+									// 多选（HD-007）：候选 = 当前能载入的技能 ∪ 角色已声明的（本机此刻没有的仍列出并标「(本机没有)」，不静默丢）；
+									// 草稿仍存逗号分隔串（保存走同一个 `patchRoleText`）；收起时摘要看得出选了哪些，键盘可用、可一键清空。
+									el(
+										'div',
+										{ className: 'cbv-skills-picker', 'data-roster-field': 'skills', 'data-skill-picker': '' },
+										el(
+											'div',
+											{ className: 'cbv-skill-picker-row', key: 'row' },
+											el(
+												'button',
+												{
+													className: 'cbv-input cbv-skill-toggle',
+													key: 'toggle',
+													type: 'button',
+													'data-skill-toggle': '',
+													'aria-expanded': skillsOpen ? 'true' : 'false',
+													onClick: () => setSkillsOpen((value) => !value),
+													onKeyDown: (event) => {
+														if (event.key === 'Escape') setSkillsOpen(false)
+													},
+												},
+												// **摘要**：收起也看得出选了哪些（没有就写"未选"）
+												el('span', { className: 'cbv-skill-summary', 'data-skill-summary': '' }, skillSummaryOf(skillSelected(draft.skills))),
+												el('span', { className: 'cbv-skill-caret', 'aria-hidden': 'true' }, skillsOpen ? '▴' : '▾'),
+											),
+											skillSelected(draft.skills).length === 0
+												? null
+												: el('button', { className: 'cbv-btn cbv-btn--mini', key: 'clear', type: 'button', 'data-skill-clear': '', onClick: () => setRosterDraft((current) => ({ ...current, skills: '' })) }, '清空'),
+										),
+										skillsOpen
+											? el(
+													'div',
+													{ className: 'cbv-skill-menu', key: 'menu', 'data-skill-menu': '' },
+													...skillChoices.map((choice) =>
+														el(
+															'label',
+															{ className: 'cbv-skill-choice', key: choice.name, 'data-skill-choice': choice.name, 'data-skill-present': choice.present ? 'true' : 'false' },
+															el('input', {
+																type: 'checkbox',
+																'data-skill-option': choice.name,
+																checked: skillSelected(draft.skills).indexOf(choice.name) !== -1,
+																onChange: () => setRosterDraft((current) => ({ ...current, skills: skillToggle(current.skills, choice.name) })),
+															}),
+															el('span', {}, choice.name + (choice.present ? '' : '（本机没有）')),
+														),
+													),
+													skillChoices.length === 0 ? el('span', { className: 'cbv-mp-field-note' }, '读不到技能目录。') : null,
+												)
+											: null,
+									),
+									note('这个角色自己的作业程序；「(本机没有)」= 此刻载入不了。', 'skills-note'),
+								),
+								el(
+									'div',
+									{ className: 'cbv-mp-field', key: 'positioning' },
+									el('div', { className: 'cbv-mp-field-label' }, '一句话定位'),
+									el('textarea', { className: 'cbv-mp-textarea', 'data-roster-field': 'positioning', rows: 2, value: draft.positioning, onChange: (event) => setRosterDraft((current) => ({ ...current, positioning: event.target.value })), placeholder: kind === 'edit' ? '（空＝这一格不动）' : '例如 对标注质量与一致性负责。' }),
+									note('会写进 front matter 的 `description`。', 'positioning-note'),
+								),
+								kind === 'create'
+									? el(
+											'div',
+											{ className: 'cbv-mp-field', key: 'body' },
+											el('div', { className: 'cbv-mp-field-label' }, '补充正文（可选）'),
+											el('textarea', { className: 'cbv-mp-textarea', 'data-roster-field': 'body', rows: 5, value: draft.body, onChange: (event) => setRosterDraft((current) => ({ ...current, body: event.target.value })), placeholder: '检查表 / 落点 / 产物形态 —— 可以留空，之后直接编辑那个 ROLE.md 也行' }),
+											note('成员动手前会读它。', 'body-note-text'),
+										)
+									: note('正文改不动，直接编辑 ROLE.md。', 'body-note'),
+								rosterError === ''
+									? null
+									: el('div', { className: 'cbv-note cbv-note--danger', key: 'roster-error', 'data-roles-error': '' }, rosterError),
+							],
+						{ narrow: true, modalRef: rosterModalRef }
+					)
+			}
+
+
+			// 加载态：工具栏 / 骨架位置固定（骨架 3 张角色卡，工具栏保留 —— 设计 5.3 / P-06）。
+			if (snapshot.phase === 'loading') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-mp cbv-mp--pane', 'data-roles-phase': 'loading', 'data-roles-state': 'ok', 'data-roles-mark': PANE_MARK },
+					el(
+						'div',
+						{ className: 'cbv-flt-bar', key: 'skeleton-toolbar', 'aria-hidden': 'true' },
+						el('span', { className: 'cbv-skel-chip cbv-skel-chip--wide', key: 'c0' }),
+						el('span', { className: 'cbv-skel-chip', key: 'c1' }),
+						el('span', { className: 'cbv-skel-search', key: 's' }),
+					),
+					el('span', { className: 'cbv-sr-only', key: 'say' }, '正在读取角色目录…'),
+					showSkeleton ? el(SkeletonList, { kind: 'roles', label: '正在读取角色目录…' }) : null,
+				)
+			}
+			// 整块错误态：只印那一行错误文案 + 一枚「重读」—— 读不到不等于没有角色。
+			if (snapshot.phase === 'error') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-mp cbv-mp--pane', 'data-roles-phase': 'error', 'data-roles-state': 'degraded', 'data-roles-mark': PANE_MARK },
+					el('div', { className: 'cbv-msg cbv-msg--error' }, '读不到角色目录：' + snapshot.error),
+					el('button', { className: 'cbv-btn', key: 'retry', type: 'button', 'data-pane-retry': 'roles', onClick: retry }, '重读'),
+				)
+			}
+
+			// 回执紧贴工具栏下方（设计 P-14）：由 `rosterSectionOf` 插在工具行之后。
+			const noticeNode = el(NoticeBar, {
+				slot: 'roles',
+				tone: rosterNotice === null ? null : rosterNotice.tone,
+				lines: rosterNotice === null ? [] : rosterNotice.lines,
+				onRetry: rosterNotice === null ? undefined : rosterNotice.retry,
+				// 成功类回执 2 秒自动隐藏（与成员块同一套）；失败的带重试，留着让人决定。
+				autoHideMs: rosterNotice !== null && rosterNotice.tone === 'ok' ? 2000 : 0,
+				onClose: () => setRosterNotice(null),
+			})
+
+			// 那一整套 render 原样搬过来（来源筛选 / 角色卡 / 导出导入 / 未建立 / 已下架）。
+			const roster = rosterSectionOf(data, {
+				notice: noticeNode,
+				// 「导出」前置禁用时点它：不发请求，只把原因说明白（与按钮下方那句同一句话）。
+				showNote: (message) => setRosterNotice({ tone: 'ok', lines: [message] }),
+				openRosterDialog: (next) => {
+					// 下架 = 可恢复、不删文件 ⇒ **不再二次确认**（人的口径）；删除 / 还原仍走确认浮窗。
+					if (next !== null && next !== undefined && next.kind === 'remove' && next.entry !== undefined && next.entry !== null && text(next.entry.removal) === 'hide') {
+						setRosterNotice(null)
+						setRosterError('')
+						postRosterHide(next.entry)
+						return
+					}
+					setRosterNotice(null)
+					setRosterError('')
+					setRosterDialog(next)
+					// 每次开窗重置草稿；编辑时四格都带现值（看不到现值等于不能用）。
+					// 保存语义：显示名 / 分类 / 定位 空 = 不动；专属技能 空 = 清掉 `skills:` 那一行（允许清空）。
+					const entry = next !== null && next.kind === 'edit' ? next.entry : null
+					setRosterDraft({
+						id: '',
+						title: entry === null ? '' : text(entry.title),
+						category: entry === null ? '' : text(entry.category),
+						positioning: entry === null ? '' : text(entry.positioning),
+						body: '',
+						// **作用域**（HD-008）：缺省本工作区；全局要人显式选。编辑时按那一份**真实来源**预选
+						// （不然打开就是"本工作区"，改一个用户根角色会把作用域悄悄改错）。
+						scope: entry !== null && (text(entry.origin) === 'user' || text(entry.origin) === 'workspace') ? text(entry.origin) : 'workspace',
+						skills: entry === null || !Array.isArray(entry.skills) ? '' : entry.skills.join(', '),
+					})
+				},
+				restoreRole: postRosterRestore,
+				setRosterOriginFacet,
+				rosterOriginFacet,
+				// 角色包：全部导出 / 导入 / 单个导出（三个动作都只是把参数发给宿主）。
+				exportRoles: () => exportRoles(),
+				importRoles: pickPackForImport,
+				exportOneRole: (entry) => exportRoles(entry === null || entry === undefined ? '' : text(entry.role)),
+			})
+
+			// 下架 / 删除 / 还原：确认浮窗里**点确认才发请求**（取消 = 零 POST）。
+			const removeEntry = rosterDialog !== null && text(rosterDialog.kind) === 'remove' ? rosterDialog.entry : null
+			const removal = removeEntry === null ? '' : text(removeEntry.removal)
+			const removeTitle = removeEntry === null ? '' : (removal === 'hide' ? '下架角色：' : removal === 'revert' ? '还原为包内：' : '删除角色：') + text(removeEntry.role)
+			const removeLines =
+				removeEntry === null
+					? []
+					: removal === 'hide'
+						? ['本工作区不再列出它；不删角色文件；随时可以恢复。']
+						: removal === 'revert'
+							? ['删掉用户根里的同名覆盖，回到包内那份。不可撤销。']
+							: ['删除该角色所在根里 `roles/<id>/` 整个目录（按来源：本工作区根 / 用户根）。不可撤销。']
+			const removeLabel = removal === 'hide' ? '下架' : removal === 'revert' ? '还原' : '删除角色'
+			const runRemoveConfirm = () => {
+				if (removeEntry === null || rosterBusy !== null) return
+				postRoster(
+					ROLES_REMOVE_ENDPOINT,
+					{ role: text(removeEntry.role) },
+					(payload) =>
+						payload.mode === 'hide'
+							? [`已下架：${payload.role}`]
+							: payload.mode === 'revert'
+								? [`已还原为包内那份：${payload.role}`]
+								: [`已删除：${payload.role}`, `删掉的是用户角色根里这个目录：${payload.file}`],
+					{ onSuccess: () => setRosterDialog(null), onFailure: (line) => setRosterError(line) },
+				)
+			}
+
+			// 空态三分（设计 P-07）：真空 / 无 `defaults` / 读不到各有各的话；`data-roles-state` 可区分。
+			const block = data !== null && data.defaults !== undefined && data.defaults !== null ? data.defaults : null
+			const rowsCount = block !== null && Array.isArray(block.rows) ? block.rows.length : 0
+			const facetNow = text(rosterOriginFacet) === '' ? 'all' : text(rosterOriginFacet)
+			const shownCount = block === null || !Array.isArray(block.rows) ? 0 : facetNow === 'all' ? rowsCount : block.rows.filter((entry) => text(entry.origin) === facetNow).length
+			const state =
+				block === null ? 'unsupported' : rowsCount === 0 ? 'empty' : shownCount === 0 ? 'filtered' : snapshot.stale === true ? 'degraded' : 'ok'
+
+			return el(
+				'div',
+				{
+					className: 'cbv-view cbv-mp cbv-mp--pane',
+					// 形态标记落在 data 上（不挂 title）：核对时在 DOM 里看 `data-roles-mark` 即可。
+					'data-roles-mark': PANE_MARK,
+					'data-roles-phase': 'ready',
+					'data-roles-state': state,
+					'data-roles-total': '' + rowsCount,
+					'data-roles-visible': '' + shownCount,
+				},
+				snapshot.stale === true
+					? el(
+							'div',
+							{ className: 'cbv-pane-warn cbv-md', key: 'stale' },
+							markdownNodes('显示的是上一次读数（这一次没读到最新的）。', 'roles-stale'),
+							el('button', { className: 'cbv-btn', key: 'stale-retry', type: 'button', 'data-stale-retry': 'roles', onClick: retry }, '重读'),
+						)
+					: null,
+				el(
+					'div',
+					{ className: 'cbv-scroll', key: 'scroll' },
+					// 老宿主没有 `defaults` 这一格 ⇒ 如实说一句，不留一整块空白。
+					roster === null
+						? [noticeNode, el('div', { className: 'cbv-pane-empty', key: 'empty' }, '这一版宿主没有返回角色目录。')]
+						: roster,
+				),
+				rosterDialog === null || text(rosterDialog.kind) === 'remove' ? null : rosterDialogOf(),
+				packDialog === null ? null : packDialogOf(),
+				el(ConfirmDialog, {
+					open: removeEntry !== null,
+					slot: 'roles-remove',
+					title: removeTitle,
+					lines: removeLines,
+					confirmLabel: removeLabel,
+					busyLabel: removeLabel + '中…',
+					danger: removal !== 'hide',
+					busy: rosterBusy !== null,
+					error: rosterError,
+					onConfirm: runRemoveConfirm,
+					onCancel: () => {
+						if (rosterBusy !== null) return
+						setRosterDialog(null)
+						setRosterError('')
+					},
+				}),
+			)
+		}
+
+		/**
+		 * 「技能」块：**当前这套系统带着哪些作业程序**（宿主的技能目录）。
+		 *
+		 * 与「成员」块是两件事，别混：成员是**人**（戴着角色上场），技能是**可复用的作业程序**；
+		 * 角色在自己的 `skills:` 里引用技能（见 《落盘与移交》的"两层"）。这一块列的清单来自**宿主的技能
+		 * 注册表**（`ctx.skills`）—— 与会话里技能工具（`skill` / `/斜杠` 那个源）用的是**同一份目录**，
+		 * 所以"面板上有的"与"模型能加载的"对得上是结构上的，不是"两边都照约定写"。
+		 *
+		 * **只读**：查看正文（`/skills/definition`，正文由宿主按 name 现读）、复制正文、复制路径。
+		 * 新建 / 删除 / 启停技能**不在这一栏**：那是改盘上的技能文件（别人家的地盘），
+		 * 本插件只把宿主已经认下的目录摆出来 —— 不造第二份真相。
+		 *
+		 * 三条口径照旧：读不到（端点 503）只印那一行**原文**、不假装是空目录；目录真的空、
+		 * 与"筛选落空"两句话不共用；`invocation` 那两格缺一档就按"不可调用"画（读不到不印成可用）。
+		 * @param props - `sessions` 取当前会话的工作目录（技能有项目级根，跟会话走）；
+		 *   `reload` 是面板的重读计数（本块自己不发请求）。
+		 */

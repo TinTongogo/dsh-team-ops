@@ -1,0 +1,615 @@
+		// ── ⑫ 成员块 ─────────────────────────────────────────────────────
+		/**
+		 * 「成员」块（视图栏第一块，打开面板即落在这里）：**本会话现在有哪些 agent**。
+		 *
+		 * 数据**只有一个来源**：本会话的 Agent 团队名册（宿主 `ctx.agentTeams`，与内置 `list_agents`
+		 * 同一处正文）—— 协调者永远在最前，其后是队友（`running` / `inactive` / `provisioning` / `failed`）。
+		 * **本插件起没起过成员都不影响它** ⇒ 这块不会"一个 agent 都不展示"。
+		 * 旧名册文件（`.ops/members.json`）已撤（task-40）：面板不读它，也没有"在册 / 未入册"了。
+		 * 卡上只读的几格各自的真源：运行时状态（活着的 Agent）、**已停用**（`.ops/member-flags.json`）、
+		 * 未读（邮箱文件）、头像与色调（引擎按角色给）。
+		 *
+		 * **这一块只读**：成员是**宿主原生的队友**，本插件不改、不删、不启停；卡上只有服务端给的那三个动词
+		 * （停用 / 恢复 / 打断，`row.verbs`），停用与打断的口径挂在各自按钮的 title 上（服务端 `why` 原文）。
+		 * **角色目录不在这里** —— 它是「角色」块（⑬ `RolesView`）；生成员也不在这里（那是 `member_spawn`）。
+		 * @param props - `sessions` 取当前会话（工作区与团队名册都按它拿）；
+		 *   `reload` 是面板的重读计数（切块 / 窗口回到前台 / 面板重新可见时 +1）；读失败时本块给一枚「重读」。
+		 */
+		function MembersView(props) {
+			const active = props.active !== false
+			const store = props.sessions === undefined ? null : typeof props.sessions === 'function' ? props.sessions() : props.sessions
+			const workspace = useCurrentWorkspace(store)
+			// 会话 id 必须带上：团队名册是按**这个会话**拿的（`?session=`），少了它宿主只能报"读不到"。
+			// 子智能体对话里点开面板时，折到**根会话**（团队挂在领队那个会话上）。
+			const sessionId = useCurrentSessionId(store)
+			const teamSessionId = teamSessionIdOf(store, sessionId)
+			// **等权威会话**：初次挂载时 `uiSession.current` 还没 publish，`resolveCurrentSessionId` 会落到
+			// "上次保留的旧会话"；拿它去问会报「会话 … 现在不活着」。等这一拍再取。
+			const ready = useSessionAuthority()
+			const target = ready ? membersUrlOf(workspace, teamSessionId) : ''
+			const [snapshot, setSnapshot] = React.useState({ phase: 'loading' })
+			const [localTick, setLocalTick] = React.useState(0)
+			// 智能体团队的开 / 关：**只有人点了那个按钮才动**（人的口径：不再二次确认）。
+			const [svcBusy, setSvcBusy] = React.useState(false)
+			// 服务未启用时用现有 `GET /team-service` 读一次 `enabled`（本会话的团队模式），据此决定画「启用」还是「关闭」。
+			const [serviceInfo, setServiceInfo] = React.useState(null)
+			// 三个筛选：身份 chip（全部 / 协调者 / 已停用）+ 运行时状态下拉 + 搜索；
+			// 一排只放一个 facet、同级互斥（不能再叠加），键形如 `lead` / `disabled` / `runtime:inactive`。
+			const [memberFacet, setMemberFacet] = React.useState('all')
+			const [query, setQuery] = React.useState('')
+			// 块顶回执（设计 ⑥.1）：`{ tone, lines, retry? }`；**下一次同块动作开始时先清旧的**。
+			const [notice, setNotice] = React.useState(null)
+			// 正在发的那个动词（`名字:动词`）—— 只用来禁用同一张卡上的按钮。
+			const [memberBusy, setMemberBusy] = React.useState(null)
+			// 确认浮窗（打断 / 智能体团队开关）：`null` = 没开；开着时带 `{ kind, name, busy, error }`。
+			const [confirm, setConfirm] = React.useState(null)
+			// 防重复提交的**同步**闸：两次点击落在同一轮里时 state 还没更新，只有 ref 顶得住。
+			const busyRef = React.useRef(false)
+			const svcBusyRef = React.useRef(false)
+			const serviceProbe = React.useRef(false)
+			// 最近的跨角色交接单（`/collab`，只读辅助信息；拿不到就不显示那一行）。
+			const [handoffNotes, setHandoffNotes] = React.useState([])
+			const showSkeleton = useSkeletonVisible(snapshot.phase === 'loading')
+
+			React.useEffect(() => {
+				if (!active || !ready) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setSnapshot({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				// **重取失败不覆盖旧数据**（设计 ⑥.3）：手里已有读数时保留它，只标 `stale`。
+				getJsonCached(target)
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null) {
+							setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: 'HTTP ' + response.status + '：响应不是 JSON' }))
+							return
+						}
+						if (payload.ok === true) {
+							setSnapshot({ phase: 'ready', data: payload })
+							return
+						}
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }))
+					})
+					.catch((error) => {
+						if (cancelled) return
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true } : { phase: 'error', error: '' + error }))
+					})
+				return () => {
+					cancelled = true
+				}
+				// props.reload：面板的重读计数；localTick：本块那几个动作之后自己重取；active：只有当前块取数。
+			}, [props.reload, localTick, target, active, ready])
+
+			// 最近交接：与名册并行取；失败静默（辅助信息，不挡成员卡）。
+			React.useEffect(() => {
+				if (!active || !ready) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') return () => {}
+				getJsonCached(collabUrlOf(workspace, teamSessionId))
+					.then((response) => response.json().then((payload) => payload, () => null))
+					.then((payload) => {
+						if (cancelled) return
+						setHandoffNotes(payload !== null && payload.ok === true && Array.isArray(payload.handoffs) ? payload.handoffs : [])
+					})
+					.catch(() => {
+						if (!cancelled) setHandoffNotes([])
+					})
+				return () => {
+					cancelled = true
+				}
+			}, [props.reload, localTick, workspace, teamSessionId, active, ready])
+
+			const data = snapshot.phase === 'ready' ? snapshot.data : null
+			// **主表 = 原生名册那一份**（`merged`）：task-40 起这是**唯一**来源。
+			const rows = data !== null && Array.isArray(data.merged) ? data.merged : []
+			const team = data !== null && data.team !== undefined && data.team !== null && typeof data.team === 'object' ? data.team : null
+			const teamAvailable = team !== null && team.available === true
+			const warnings = data !== null && Array.isArray(data.warnings) ? data.warnings : []
+
+			// 智能体团队「关了还是开着」：**总是读一次**（不新增端点、不轮询）。
+			// 不能只在 `!teamAvailable` 时读：成员层迁到 subagent 后，团队模式关着名册也可能读得到，
+			// 那样 `teamAvailable` 一直为 true ⇒ 永远只画「关闭」、画不出「开启」。
+			React.useEffect(() => {
+				if (!active || !ready || snapshot.phase !== 'ready' || serviceProbe.current === true) return
+				serviceProbe.current = true
+				if (typeof fetch !== 'function') return
+				// 读端点照规矩走**唯一的取数出口**（`getJsonCached`）：它不改任何东西，也不需要绕缓存。
+				// **必须带根会话的 `?session=`**：宿主 `setEnabled` 只认活着的 root Session。
+				getJsonCached(TEAM_SERVICE_ENDPOINT + paneQueryOf(workspace, teamSessionId))
+					.then((response) => response.json().then((payload) => payload, () => null))
+					.then((payload) => {
+						if (payload !== null && payload.ok === true && typeof payload.enabled === 'boolean') {
+							setServiceInfo({ enabled: payload.enabled })
+						}
+					})
+					.catch(() => {
+						/* 读不到就当未知：仍给「启用智能体团队」那一枚（点了才知道结果） */
+					})
+			}, [active, snapshot.phase, workspace, teamSessionId, ready])
+
+			/** 子会话 id 的**短显示**：只截长的（留尾部 12 位）；截的是显示，不是数据。 */
+			const shortSession = (value) => {
+				const full = text(value)
+				if (full === '') return '—'
+				return full.length <= 16 ? full : '…' + full.slice(-12)
+			}
+			const runtimeWordOf = (value) => MEMBER_RUNTIME_WORDS[value] ?? (value === '' ? '（未记）' : value)
+			const runtimeValues = facetValuesOf(rows, 'runtime')
+			// 身份与运行时值同级互斥、只留一枚「全部」；每项带自己的计数口径（重叠成员各自计入）。
+			const memberFacets = [
+				{ key: 'all', label: '全部', match: () => true },
+				...MEMBER_STAGES.filter((spec) => spec.key !== 'all').map((spec) => ({ key: spec.key, label: spec.label, match: spec.match })),
+				...runtimeValues.map((value) => ({
+					key: 'runtime:' + (value === '' ? 'none' : value),
+					label: runtimeWordOf(value),
+					match: (row) => text(row.runtime) === value,
+				})),
+			]
+			const memberFacetSpec = memberFacets.find((spec) => spec.key === memberFacet) ?? memberFacets[0]
+			const memberFacetCount = (spec) => rows.filter((row) => spec.match(row)).length
+			const needle = query.trim().toLowerCase()
+			const visible = rows.filter((row) => memberFacetSpec.match(row) && (needle === '' || haystackOf(row).indexOf(needle) !== -1))
+
+			/**
+			 * 成员那三个动词的发送器（**停用 / 恢复 / 打断**）：POST 之后重取这一块（`localTick`）。
+			 *
+			 * 服务端给动词（`row.verbs`），客户端只负责发与说结果；回执里 `note` **原样**印出来。
+			 * 失败时**不动列表 / 徽标**（设计 ⑥.3：不做乐观更新），给「重试」；`opts.onFailure`
+			 * 用来把失败留在**确认浮窗内**（打断那条：浮窗失败时不关）。
+			 * @param url - 端点。
+			 * @param name - 成员名。
+			 * @param verb - 中文动词（回执兜底文案用）。
+			 * @param opts - `{ onSuccess, onFailure }`。
+			 */
+			const postMemberVerb = (url, name, verb, opts) => {
+				const options = opts === undefined || opts === null ? {} : opts
+				if (busyRef.current) return
+				busyRef.current = true
+				if (typeof fetch !== 'function') {
+					busyRef.current = false
+					setNotice({ tone: 'error', lines: ['当前环境没有 fetch'] })
+					return
+				}
+				setMemberBusy(name + ':' + verb)
+				setNotice(null)
+				fetch(url + paneQueryOf(workspace, teamSessionId), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ name }),
+				})
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						busyRef.current = false
+						setMemberBusy(null)
+						if (payload !== null && payload.ok === true) {
+							setNotice({ tone: 'ok', lines: [text(payload.note) === '' ? verb + '成功：' + name : text(payload.note)] })
+							invalidatePanes()
+							setLocalTick((value) => value + 1)
+							if (typeof options.onSuccess === 'function') options.onSuccess(payload)
+							return
+						}
+						const line = payload !== null && text(payload.error) !== '' ? text(payload.error) : 'HTTP ' + String(response === undefined ? '' : response.status)
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(line)
+							return
+						}
+						setNotice({ tone: 'error', lines: [line], retry: () => postMemberVerb(url, name, verb, options) })
+					})
+					.catch((error) => {
+						busyRef.current = false
+						setMemberBusy(null)
+						const line = '发不出去：' + String(error && error.message ? error.message : error)
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(line)
+							return
+						}
+						setNotice({ tone: 'error', lines: [line], retry: () => postMemberVerb(url, name, verb, options) })
+					})
+			}
+			/**
+			 * 卡上那三个动词的按钮：**只看载荷给的 `verbs`**（服务端判过"现在能不能做"，客户端不猜）。
+			 *
+			 * 不能做（`spec.ok !== true`）时**不用原生 `disabled`**：改用 `aria-disabled` + `aria-describedby`
+			 * 指向一枚视觉隐藏的理由（`spec.why` 原文），点击只把理由送进块顶回执、**不发请求**
+			 * （设计 P-05：键盘与触摸都拿得到理由，title 不再是唯一入口）。
+			 * @param row - 成员行。
+			 * @param name - 成员名。
+			 * @returns 节点数组（按钮 + 视觉隐藏的理由）。
+			 */
+			const verbButtonsOf = (row, name) => {
+				const verbs = row !== null && row !== undefined && row.verbs !== null && row.verbs !== undefined ? row.verbs : {}
+				const busy = memberBusy !== null && String(memberBusy).indexOf(name + ':') === 0
+				const buttonOf = (key, label, verb, url) => {
+					const spec = verbs[verb]
+					// **载荷没给这一格 ⇒ 不画**（那件事在这个上下文里不存在）。
+					if (spec === null || spec === undefined) return null
+					const why = text(spec.why)
+					const unavailable = spec.ok !== true
+					const whyId = 'cbv-mem-why-' + String(name).replace(/[^A-Za-z0-9_-]/g, '-') + '-' + verb
+					const button = el(
+						'button',
+						{
+							className: 'cbv-cardbtn' + (unavailable ? ' cbv-cardbtn--off' : ''),
+							key,
+							type: 'button',
+							// 临时不可用（正在执行）仍用原生 disabled；条件不允许用 aria-disabled（还能聚焦、能听见理由）。
+							disabled: busy,
+							'aria-disabled': unavailable ? 'true' : undefined,
+							'aria-describedby': unavailable && why !== '' ? whyId : undefined,
+							'data-member-verb': verb,
+							'data-member-name': name,
+							'data-member-verb-ok': unavailable ? 'false' : 'true',
+							...(why === '' ? {} : { title: why }),
+							onClick: () => {
+								if (busyRef.current) return
+								if (unavailable) {
+									setNotice({ tone: 'ok', lines: [why === '' ? '这个动作现在不可用。' : why] })
+									return
+								}
+								// **打断**会中止当前一轮 ⇒ 先进确认浮窗（取消则零 POST）。
+								if (verb === 'interrupt') {
+									setNotice(null)
+									setConfirm({ kind: 'interrupt', name, busy: false, error: '' })
+									return
+								}
+								postMemberVerb(url, name, label)
+							},
+						},
+						label,
+					)
+					// 理由单独一根节点（`aria-describedby` 指过来）；不塞进按钮内部，免得重复进可访问名。
+					// 理由节点走 markdown 渲染：`spec.why` 原文里带 `**` / 反引号，直接当文本印会在界面上露出标记。
+					const whyNode = unavailable && why !== '' ? el('span', { className: 'cbv-sr-only', id: whyId, key: whyId }, markdownNodes(why, whyId)) : null
+					return [button, whyNode]
+				}
+				return [
+					buttonOf('disable', '停用', 'disable', MEMBERS_DISABLE_ENDPOINT),
+					buttonOf('restore', '恢复', 'restore', MEMBERS_RESTORE_ENDPOINT),
+					buttonOf('interrupt', '打断', 'interrupt', MEMBERS_INTERRUPT_ENDPOINT),
+				].flat()
+			}
+
+			/**
+			 * 开 / 关**本会话的智能体团队**（与根会话「模型与推理等级菜单 → 使用智能体团队」同一个开关）。
+			 *
+			 * 调的是宿主 `agentTeams.setEnabled(root, enabled)`（新版本已退役 profile 级 bundle），结果是**原样回显**。
+			 * **只由人点按钮才动**（人的口径：启停智能体团队、角色下架都不再二次确认）—— 不静默改 profile。
+			 * `?session=` 必须带**根会话**：宿主只认活着的 root Session（descendant 会回 `TEAM_LEAD_REQUIRED`）。
+			 * @param action - `enable` 或 `disable`。
+			 * @param opts - `{ onFailure }`（留在确认浮窗里）。
+			 */
+			const postTeamService = (action, opts) => {
+				const options = opts === undefined || opts === null ? {} : opts
+				if (svcBusyRef.current) return
+				svcBusyRef.current = true
+				if (typeof fetch !== 'function') {
+					svcBusyRef.current = false
+					setNotice({ tone: 'error', lines: ['当前环境没有 fetch'] })
+					return
+				}
+				setSvcBusy(true)
+				setNotice(null)
+				fetch(TEAM_SERVICE_ENDPOINT + paneQueryOf(workspace, teamSessionId), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ action }),
+				})
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						svcBusyRef.current = false
+						setSvcBusy(false)
+						if (payload !== null && payload.ok === true) {
+							const lines = []
+							const known = payload.enabled === true || payload.enabled === false
+							lines.push(
+								known
+									? payload.enabled === true
+										? '已为本会话启用智能体团队（等同于模型菜单里的「使用智能体团队」）。'
+										: '已为本会话关闭智能体团队。'
+									: '已执行，但当前状态读不到；请以模型菜单里的「使用智能体团队」为准。',
+							)
+							if (Array.isArray(payload.warnings)) lines.push(...payload.warnings.map((line) => text(line)))
+							setNotice({ tone: 'ok', lines })
+							if (known) setServiceInfo({ enabled: payload.enabled === true })
+							invalidatePanes()
+							setLocalTick((value) => value + 1)
+							setConfirm(null)
+							return
+						}
+						const lines = [payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status]
+						if (payload !== null && Array.isArray(payload.warnings)) lines.push(...payload.warnings.map((line) => text(line)))
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(lines.join('；'))
+							return
+						}
+						setNotice({ tone: 'error', lines, retry: () => postTeamService(action, options) })
+					})
+					.catch((error) => {
+						svcBusyRef.current = false
+						setSvcBusy(false)
+						const line = '请求失败：' + (error === null || error === undefined ? '未知错误' : String(error.message ?? error))
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(line)
+							return
+						}
+						setNotice({ tone: 'error', lines: [line], retry: () => postTeamService(action, options) })
+					})
+			}
+
+			/** 确认浮窗「确认」：**只有走到这里才发请求**（现在只剩「打断」还需要确认）。 */
+			const runConfirm = () => {
+				if (confirm === null || confirm.busy === true) return
+				const current = confirm
+				if (current.kind !== 'interrupt') return
+				setConfirm({ ...current, busy: true, error: '' })
+				postMemberVerb(MEMBERS_INTERRUPT_ENDPOINT, current.name, '打断', {
+					onSuccess: () => setConfirm(null),
+					onFailure: (line) => setConfirm((now) => (now === null ? now : { ...now, busy: false, error: line })),
+				})
+			}
+			const confirmSpecOf = () => {
+				if (confirm === null || confirm.kind !== 'interrupt') return { open: false }
+				return {
+					open: true,
+					title: '打断 ' + confirm.name + ' 当前这一轮？',
+					lines: ['只打断它当前这一轮。收件箱里的消息保留；原生名册与两条上限不变；下次 `member_send` 唤醒它照旧接着干。'],
+					confirmLabel: '打断',
+					busyLabel: '打断中…',
+					danger: false,
+					busy: confirm.busy === true,
+					error: confirm.error,
+				}
+			}
+
+			/**
+			 * 一张成员卡：**只读 live 字段**（卡上不再有任何来自旧名册文件的东西）。
+			 */
+			const cardOf = (row, index) => {
+				const name = text(row.name)
+				const runtime = text(row.runtime)
+				const runtimeTone = runtime === 'running' ? 'present' : runtime === 'failed' ? 'warn' : 'ok'
+				const disabled = row.disabled === true
+				const avatar = text(row.avatar) === '' ? (row.kind === 'lead' ? 'target' : 'user') : text(row.avatar)
+				const tone = text(row.avatarTone) === '' ? (row.kind === 'lead' ? 'exec' : 'eng') : text(row.avatarTone)
+				const duty = text(row.description)
+				const identity = row.kind === 'lead' ? '协调者' : '队友'
+				return el(
+					'div',
+					{
+						className: 'cbv-box cbv-mp-card' + (disabled ? ' cbv-mp-card--off' : ''),
+						key: row.key === undefined ? 'mem' + index + '#' + name : row.key,
+						'data-mem-kind': text(row.kind),
+						'data-mem-name': name,
+						'data-mem-id': text(row.session),
+						'data-mem-runtime': runtime === '' ? 'unknown' : runtime,
+						'data-mem-disabled': disabled ? 'true' : 'false',
+					},
+					el(
+						'div',
+						{ className: 'cbv-mp-top', key: 'top' },
+						el('span', { className: 'cbv-mp-avatar cbv-mp-avatar--' + tone, key: 'av' }, avatarIconOf(avatar)),
+						el(
+							'div',
+							{ className: 'cbv-mp-nameblock', key: 'names' },
+							el('div', { className: 'cbv-mp-name', key: 'name' }, name === '' ? '（无名）' : name),
+							el(
+								'div',
+								{ className: 'cbv-badges', key: 'badges' },
+								el('span', { className: 'cbv-badge' + (row.kind === 'lead' ? ' cbv-badge--present' : ''), key: 'kind' }, identity),
+								runtime === '' ? null : el('span', { className: 'cbv-badge cbv-badge--' + runtimeTone, key: 'runtime' }, runtimeWordOf(runtime)),
+								disabled
+									? el(
+											'span',
+											{
+												className: 'cbv-badge cbv-badge--warn',
+												key: 'disabled',
+												'data-mem-disabled-badge': 'true',
+												title: '本插件不再派活给它（不占角色槽位）；它在宿主原生界面里仍然可以打开对话',
+											},
+											'已停用',
+										)
+									: null,
+							),
+							el(
+								'div',
+								{ className: 'cbv-mp-sub', key: 'sub' },
+								'会话 ' + shortSession(row.session) +
+									(text(row.model) === '' ? '' : ' · 模型 ' + text(row.model)) +
+									(text(row.provider) === '' ? '' : ' · 提供者 ' + text(row.provider)) +
+									(text(row.context) === '' ? '' : ' · 上下文 ' + text(row.context)),
+							),
+						),
+					),
+					el(
+						'div',
+						{ className: 'cbv-mp-duty', key: 'duty' },
+						duty !== '' ? duty : row.kind === 'lead' ? '拆解 · 派发 · 把关 · 收口' : '（原生没给这一条的 description）',
+					),
+					el(
+						'div',
+						{ className: 'cbv-mp-row', key: 'session' },
+						el('span', { className: 'cbv-mp-key', key: 'k' }, '子会话 '),
+						text(row.session) === '' ? '（原生没给会话 id）' : shortSession(row.session),
+					),
+					// 最近交接：这一位最近一次作为接收方（`to`）或发出方（`from`）；没有就不画这一行。
+					(() => {
+						const roleId = text(row.roleId)
+						const note = handoffNotes
+							.slice()
+							.reverse()
+							.find((item) => text(item.to) === name || (roleId !== '' && text(item.to) === roleId) || text(item.from) === name)
+						if (note === undefined) return null
+						return el(
+							'div',
+							{ className: 'cbv-mp-row', key: 'handoff' },
+							el('span', { className: 'cbv-mp-key', key: 'k' }, '最近交接 '),
+							`${text(note.from)} → ${text(note.to)}：${text(note.artifact)}`,
+						)
+					})(),
+					// 动作条：三个动词由服务端给（`row.verbs`）；不能做的也画出来（`aria-disabled` + 理由）。
+					(() => {
+						const actions = verbButtonsOf(row, name).filter((node) => node !== null && node !== undefined)
+						return actions.length === 0 ? null : el('div', { className: 'cbv-cardbar', key: 'actions' }, ...actions)
+					})(),
+				)
+			}
+
+			// **落空与读失败都给人下一步**：前者清掉筛选，后者当场重读一次。
+			const clearFilters = () => {
+				setMemberFacet('all')
+				setQuery('')
+			}
+			const retry = () => {
+				invalidatePanes()
+				setLocalTick((value) => value + 1)
+			}
+
+			// 加载态：**工具栏位置不动**（骨架与内容同一外层高度），3 张卡骨架（设计 5.3）。
+			if (snapshot.phase === 'loading') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-mp cbv-mp--pane', 'data-members-phase': 'loading', 'data-members-state': 'ok', 'data-members-mark': PANE_MARK },
+					el(
+						'div',
+						{ className: 'cbv-flt-bar', key: 'skeleton-toolbar', 'aria-hidden': 'true' },
+						el('span', { className: 'cbv-skel-chip cbv-skel-chip--wide', key: 'c0' }),
+						el('span', { className: 'cbv-skel-chip', key: 'c1' }),
+						el('span', { className: 'cbv-skel-search', key: 's' }),
+					),
+					el('span', { className: 'cbv-sr-only', key: 'say' }, '正在读取本会话的成员与 agent…'),
+					showSkeleton ? el(SkeletonList, { kind: 'members', label: '正在读取本会话的成员与 agent…' }) : null,
+				)
+			}
+			// 整块错误态：只印那一行错误 + 一枚「重读」，不渲染卡 / 条 / 数 —— "读不成"不等于"不存在"。
+			if (snapshot.phase === 'error') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-mp cbv-mp--pane', 'data-members-phase': 'error', 'data-members-state': 'degraded', 'data-members-mark': PANE_MARK },
+					el('div', { className: 'cbv-msg cbv-msg--error' }, '读不到成员名册：' + snapshot.error),
+					el('button', { className: 'cbv-btn', key: 'retry', type: 'button', 'data-pane-retry': 'members', onClick: retry }, '重读'),
+				)
+			}
+
+			// 筛选行**永远画**：主表里有团队那一份（协调者至少一行），所以不存在"未建立时画出来就是筛完剩 0 张卡"。
+			const toolbar = el(
+				'div',
+				{ className: 'cbv-flt-bar', key: 'toolbar' },
+				el(
+					'span',
+					{ className: 'cbv-badges', key: 'facets', 'data-members-facets': '' + memberFacets.length },
+					memberFacets.map((spec) =>
+						el(
+							'button',
+							{
+								className: 'cbv-flt-chip' + (spec.key === memberFacetSpec.key ? ' cbv-flt-chip--on' : ''),
+								key: spec.key,
+								type: 'button',
+								'data-members-facet': spec.key,
+								'aria-pressed': spec.key === memberFacetSpec.key ? 'true' : 'false',
+								onClick: () => setMemberFacet(spec.key),
+							},
+							spec.label + ' ' + memberFacetCount(spec),
+						),
+					),
+				),
+				el('input', {
+					className: 'cbv-input cbv-flt-search',
+					key: 'query',
+					type: 'search',
+					value: query,
+					placeholder: '搜索：名字 / 编号 / 角色 / 职责 / 会话 / 模型…',
+					'aria-label': '搜索成员',
+					onChange: (event) => setQuery(event.target.value),
+					onKeyDown: (event) => {
+						// Esc 清空搜索并**保持焦点**（设计 4.1）。
+						if (event !== null && event !== undefined && event.key === 'Escape') {
+							event.preventDefault()
+							setQuery('')
+						}
+					},
+				}),
+				// 团队模式开关：**开 / 关都在这里**（等价于模型菜单的「使用智能体团队」）。
+				// 状态未知（探测没回来 / 服务不在）时不画 —— 画一个猜出来的动词比不画更糟。
+				serviceInfo === null
+					? null
+					: serviceInfo.enabled === true
+						? el('button', { className: 'cbv-btn cbv-btn--mini', key: 'svc-toggle', type: 'button', 'data-team-service': 'disable', disabled: svcBusy, onClick: () => postTeamService('disable') }, '关闭智能体团队')
+						: el('button', { className: 'cbv-btn cbv-btn--primary', key: 'svc-toggle', type: 'button', 'data-team-service': 'enable', disabled: svcBusy, onClick: () => postTeamService('enable') }, '启用智能体团队'),
+			)
+
+			const nothingAtAll = rows.length === 0
+			const filteredOut = rows.length > 0 && visible.length === 0
+			const state = nothingAtAll ? 'empty' : filteredOut ? 'filtered' : warnings.length > 0 || !teamAvailable || snapshot.stale === true ? 'degraded' : 'ok'
+			const body = nothingAtAll
+				? el(
+						'div',
+						{ className: 'cbv-pane-empty', key: 'empty' },
+						teamAvailable
+							? '本会话的 agent 名册是空的（连协调者都没有 —— 这不正常，重启一下会话看看）。'
+							: '读不到本会话的 agent 名册 —— 见上面的告警。',
+						el('button', { className: 'cbv-btn', key: 'reload', type: 'button', 'data-empty-action': 'members-retry', onClick: retry }, '重读'),
+					)
+				: visible.length === 0
+					? el(
+							'div',
+							{ className: 'cbv-pane-empty cbv-pane-empty--filters', key: 'nofilter' },
+							el('span', { key: 'word' }, `没有匹配的条目（本会话共 ${rows.length} 条）。`),
+							el('button', { className: 'cbv-btn', key: 'clear', type: 'button', 'data-filters-clear': 'members', onClick: clearFilters }, '清除筛选'),
+						)
+					: el('div', { className: 'cbv-mp-grid', key: 'grid' }, visible.map((row, index) => cardOf(row, index)))
+
+			return el(
+				'div',
+				{
+					className: 'cbv-view cbv-mp cbv-mp--pane',
+					'data-members-mark': PANE_MARK,
+					'data-members-phase': 'ready',
+					'data-members-state': state,
+					'data-members-team': teamAvailable ? 'true' : 'false',
+					'data-members-rows': '' + rows.length,
+					'data-members-total': '' + rows.length,
+					'data-members-visible': '' + visible.length,
+				},
+				warnings.map((line, index) => el('div', { className: 'cbv-pane-warn cbv-md', key: 'warn' + index }, markdownNodes(line, 'members-warn' + index))),
+				snapshot.stale === true
+					? el(
+							'div',
+							{ className: 'cbv-pane-warn cbv-md', key: 'stale' },
+							markdownNodes('显示的是上一次读数（这一次没读到最新的）。', 'members-stale'),
+							el('button', { className: 'cbv-btn', key: 'stale-retry', type: 'button', 'data-stale-retry': 'members', onClick: retry }, '重读'),
+						)
+					: null,
+				toolbar,
+				// 回执紧贴工具栏下方（设计 P-14）：成功 `role=status`、失败 `role=alert`。
+				el(NoticeBar, {
+					slot: 'members',
+					tone: notice === null ? null : notice.tone,
+					lines: notice === null ? [] : notice.lines,
+					onRetry: notice === null ? undefined : notice.retry,
+					// 成功类回执（如「智能体团队已启用」）2 秒自动隐藏；**带重试的失败回执不自动隐藏**
+					// （那是让人决定要不要重试的，收起它等于把动作入口藏了）。
+					autoHideMs: notice !== null && notice.tone === 'ok' ? 2000 : 0,
+					onClose: () => setNotice(null),
+				}),
+				el('div', { className: 'cbv-scroll', key: 'scroll' }, body),
+				el(
+					ConfirmDialog,
+					{
+						...confirmSpecOf(),
+						slot: confirm === null ? 'members' : confirm.kind,
+						onConfirm: runConfirm,
+						onCancel: () => {
+							if (confirm !== null && confirm.busy === true) return
+							setConfirm(null)
+						},
+					},
+				),
+			)
+		}
+
+

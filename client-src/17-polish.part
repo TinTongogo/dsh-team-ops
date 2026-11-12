@@ -1,0 +1,459 @@
+		// ── ⑰ 输入框提示词增强（原「润色」）──────────────────────────────────
+		// **本片段排在 ⑯ 之后，而 ⑯ 末尾已经 `return exports`** —— 所以这一片里**只能出现函数声明**：
+		// function 声明在函数体入口就被提升（可以放心被 ⑯ 的 `apply` 引用），而 `const` / `let`
+		// 的初始化语句在 `return` 之后永远不执行，写成 const 会在渲染时抛 TDZ。
+		// 新增常量请放进函数体内；`tests/panel-blocks.test.mjs` 钉着"这一片不许有顶层 const/let"。
+		//
+		// 人的口径（task-7）：**提示词增强 + 极简交互** ——
+		//   · 点按钮**不弹浮窗**，成功后**直接把输入框草稿换成增强后的文字**；
+		//   · 按钮随即变成**撤回图标**（`aria-label="撤回润色"`），再点把增强前的原文写回去；
+		//   · 空草稿不响应；请求中重复点击不重发；草稿被手动改动后撤回失效；
+		//   · 失败：弹**通用确认浮窗**（`ConfirmDialog`，复用 ⑩ 的那一个外壳）说明原因与下一步；按钮同时进
+		//     失败态（4 秒后收回）+ `console.warn` + 一个 `cbv-sr-only role=status`；
+		//   · `@` 引用**不再阻止**增强（人确认：引用是结构化对象，但润色只改文字、不整份重建引用）。
+		// 对比浮窗 / 词级 diff / 改动摘要 / 采纳 / 取消 / 重新润色 / 撤销按钮**都已删除**。
+
+		/**
+		 * 润色图标：一颗四角星 + 一颗小星（内联 SVG，描边、`currentColor`；与 ⑦ 的头像同一套几何风格）。
+		 * @returns 节点。
+		 */
+		function polishIconOf() {
+			return el(
+				'svg',
+				{
+					className: 'cbv-polish-icon',
+					viewBox: '0 0 24 24',
+					width: '16',
+					height: '16',
+					fill: 'none',
+					stroke: 'currentColor',
+					strokeWidth: '1.8',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+					'aria-hidden': 'true',
+					focusable: 'false',
+					'data-polish-icon': 'enhance',
+				},
+				el('path', { key: 'star', d: 'M12 3.2l1.9 4.9 4.9 1.9-4.9 1.9L12 16.8l-1.9-4.9L5.2 10l4.9-1.9z' }),
+				el('path', { key: 'spark', d: 'M18.4 15.1l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8z' }),
+			)
+		}
+
+		/**
+		 * 撤回图标：回身箭头（Undo）。与润色图标同一套描边几何。
+		 * @returns 节点。
+		 */
+		function polishUndoIconOf() {
+			return el(
+				'svg',
+				{
+					className: 'cbv-polish-icon',
+					viewBox: '0 0 24 24',
+					width: '16',
+					height: '16',
+					fill: 'none',
+					stroke: 'currentColor',
+					strokeWidth: '1.8',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+					'aria-hidden': 'true',
+					focusable: 'false',
+					'data-polish-icon': 'undo',
+				},
+				el('polyline', { key: 'head', points: '9,5.5 4.5,10 9,14.5' }),
+				el('path', { key: 'arc', d: 'M4.5 10h9.5a5.5 5.5 0 0 1 0 11H9' }),
+			)
+		}
+
+		/**
+		 * 失败图标：圆 + 感叹号（内联 SVG，描边、`currentColor`；失败态短暂可见，可点击重试）。
+		 * @returns 节点。
+		 */
+		function polishErrorIconOf() {
+			return el(
+				'svg',
+				{
+					className: 'cbv-polish-icon',
+					viewBox: '0 0 24 24',
+					width: '16',
+					height: '16',
+					fill: 'none',
+					stroke: 'currentColor',
+					strokeWidth: '1.8',
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+					'aria-hidden': 'true',
+					focusable: 'false',
+					'data-polish-icon': 'error',
+				},
+				el('circle', { key: 'ring', cx: '12', cy: '12', r: '8.5' }),
+				el('path', { key: 'stem', d: 'M12 7.6v5.2' }),
+				el('path', { key: 'dot', d: 'M12 16.1v.1' }),
+			)
+		}
+
+		/**
+		 * 字数：按**码点**数（"空草稿"的判据；中文一个字算 1，不按 UTF-16 长度算成 2）。
+		 * @param value - 文本。
+		 * @returns 字数。
+		 */
+		function polishCharsOf(value) {
+			let count = 0
+			for (const unused of text(value)) count += 1
+			return count
+		}
+
+		/**
+		 * 失败原因：优先用服务端 `error` 原文（契约里的 `reason` 只用于归类）。
+		 * @param status - HTTP 状态码。
+		 * @param data - 响应 JSON（可能为 null）。
+		 * @returns 一句原因（进 console.warn 与读屏节点）。
+		 */
+		function polishFailureTextOf(status, data) {
+			if (data !== null && data !== undefined && typeof data.error === 'string' && data.error !== '') return data.error
+			return 'HTTP ' + status
+		}
+
+		/**
+		 * 失败原因 → 弹窗文案。**归类只看服务端契约里的 `reason`**，正文用 `error` 原文（不另写一套原因）。
+		 * 主按钮只有两种：确实值得再试的给「重试」；配置 / 输入类问题给「知道了」（点它只关闭，不重发）。
+		 * @param status - HTTP 状态码。
+		 * @param data - 响应 JSON（可能为 null）。
+		 * @returns {{ title: string, lines: string[], confirmLabel: string, retry: boolean }}
+		 */
+		function polishFailureSpecOf(status, data) {
+			const error = polishFailureTextOf(status, data)
+			const reason = data !== null && data !== undefined && typeof data.reason === 'string' ? data.reason : ''
+			if (reason === 'bad-request') {
+				return { title: '润色请求不合法', lines: [error, '按提示改一下草稿再试。'], confirmLabel: '知道了', retry: false }
+			}
+			if (reason === 'too-vague') {
+				return { title: '草稿太短', lines: [error, '先写清要改什么，再润色。'], confirmLabel: '知道了', retry: false }
+			}
+			if (reason === 'no-route') {
+				return { title: '还没有可用的模型路由', lines: [error, '先在本会话发一条消息，让会话拿到模型路由，再回来润色。'], confirmLabel: '知道了', retry: false }
+			}
+			if (reason === 'busy') {
+				return { title: '上一条润色还没回来', lines: [error, '等它回来，或关掉这条提示后再试。'], confirmLabel: '重试', retry: true }
+			}
+			if (reason === 'rate-limited') {
+				return { title: '润色太频繁了', lines: [error, '稍等一会儿再试。'], confirmLabel: '重试', retry: true }
+			}
+			if (reason === 'timeout') {
+				return { title: '润色超时', lines: [error, '可以重试一次；草稿很长时也会更慢。'], confirmLabel: '重试', retry: true }
+			}
+			if (reason === 'upstream') {
+				return { title: '模型调用失败', lines: [error, '检查模型 / 网络后再试。'], confirmLabel: '重试', retry: true }
+			}
+			return { title: '润色失败', lines: [error, '可以重试一次。'], confirmLabel: '重试', retry: true }
+		}
+
+		/**
+		 * 客户端侧失败（发不出去 / 写不回输入框）的弹窗文案：与 HTTP 失败分开，别把本机问题说成模型问题。
+		 * @param title - 标题。
+		 * @param message - 具体原因（进正文）。
+		 * @param retry - 主按钮是不是「重试」。
+		 * @returns {{ title: string, lines: string[], confirmLabel: string, retry: boolean }}
+		 */
+		function polishClientFailureSpecOf(title, message, retry) {
+			return { title, lines: [message, retry ? '检查本地服务 / 网络后再试。' : '请手动处理后再试。'], confirmLabel: retry ? '重试' : '知道了', retry }
+		}
+
+		/**
+		 * 输入框右侧那一枚「润色」按钮（提示词增强 + 撤回两态，**没有浮窗**）。
+		 *
+		 * 三件不肯猜的事：
+		 *   · **草稿是标准 prop**（`useInput`）⇒ 写入走 `inputActions.setDraft`，与本体同一处；
+		 *   · **增强成功后直接替换草稿**（task-7 的人口径），不再走"对比 → 采纳"那两步；
+		 *   · **撤回只对"刚增强出来的那份文本"有效**：草稿被手动改动过，按钮就回到润色态。
+		 * @param props - 席位标准 props（`useInput` / `inputActions` / `sessionId` / `useSessions`）+ 外部塞进来的 `sessions`。
+		 * @returns 节点。
+		 */
+		function PolishEntry(props) {
+			const slotsProps = props === null || props === undefined ? {} : props
+			const sessionsService = slotsProps.sessions === undefined || slotsProps.sessions === null ? serviceOf('sessions') : slotsProps.sessions
+			const sessionId = typeof slotsProps.sessionId === 'string' ? slotsProps.sessionId : resolveCurrentSessionId()
+			// 与「角色」席位同一处口径：子会话折到根会话（团队 / 技能 / 工作区都挂在那儿）。
+			const teamSessionId = teamSessionIdOf(sessionsService?.list, sessionId)
+			// workspace：优先席位标准 prop `useSessions`，取不到再从会话清单读（同一处口径）。
+			const workspaceFromProp =
+				typeof slotsProps.useSessions === 'function'
+					? text(
+							slotsProps.useSessions((state) =>
+								teamSessionId === '' || state === null || state === undefined || typeof state.byId !== 'object' || state.byId === null
+									? undefined
+									: state.byId[teamSessionId]?.cwd,
+							),
+						)
+					: ''
+			const workspace = workspaceFromProp !== '' ? workspaceFromProp : workspaceOfSession(sessionsService, teamSessionId)
+			const inputState = typeof slotsProps.useInput === 'function' ? slotsProps.useInput((state) => state) : null
+			const draft = inputState === null || inputState === undefined ? '' : text(inputState.draft)
+			const setDraft =
+				typeof slotsProps.inputActions === 'object' && slotsProps.inputActions !== null && typeof slotsProps.inputActions.setDraft === 'function'
+					? slotsProps.inputActions.setDraft
+					: null
+			// idle / requesting / enhanced（撤回态）。
+			const [phase, setPhase] = React.useState('idle')
+			// 增强前的原文 / 增强后的文本：撤回用；手动改动后这一对就作废。
+			const [original, setOriginal] = React.useState('')
+			const [enhanced, setEnhanced] = React.useState('')
+			// 给读屏的最近一次结果（成功/失败）；**界面不弹提示条**（失败另有弹窗，见 `failure`）。
+			const [status, setStatus] = React.useState('')
+			// 失败原因：按钮态 + 原生 title（兜底），完整原因与下一步进 `failure` 弹窗。
+			const [errorText, setErrorText] = React.useState('')
+			// 失败弹窗：`null` = 不显示；否则 `{ title, lines, confirmLabel, retry }`（见 polishFailureSpecOf）。
+			const [failure, setFailure] = React.useState(null)
+			// 失败时的草稿快照：人手动改了草稿就把失败态收起来（不是拿旧错误吓人）。
+			const errorDraftRef = React.useRef('')
+			const requestNo = React.useRef(0)
+			const abortRef = React.useRef(null)
+			const busyRef = React.useRef(false)
+			const sessionRef = React.useRef(sessionId)
+			// "刚把增强结果写进草稿"的标记：宿主把 setDraft 落到 `useInput` 可能晚一帧，
+			// 那一帧里 `draft` 还是原文 —— 不能把它当成"人手动改了草稿"而立刻取消撤回态。
+			const appliedRef = React.useRef(false)
+			// **撤回后再点润色 = 要求重新生成一次**（绕过宿主 3 分钟结果缓存）；只对紧接着的一次请求生效。
+			const refreshNext = React.useRef(false)
+
+			/** 取消在途请求（换会话 / 卸载都走它）。 */
+			function polishAbort() {
+				requestNo.current += 1
+				busyRef.current = false
+				const controller = abortRef.current
+				abortRef.current = null
+				if (controller !== null && controller !== undefined && typeof controller.abort === 'function') {
+					try {
+						controller.abort()
+					} catch {
+						/* 已经结束的请求再 abort 也不该抛 */
+					}
+				}
+			}
+
+			/**
+			 * 失败：按钮进失败态（图标 + 原生 title，4 秒后收回）**并弹通用确认浮窗**（标题 / 正文 / 主按钮
+			 * 由 `spec` 给）—— 失败原因不再只藏在 title 里；同时写 console.warn 与读屏节点（无障碍）。
+			 * @param message - 原因原文（按钮 title / 读屏 / console 用）。
+			 * @param spec - 弹窗文案（见 `polishFailureSpecOf` / `polishClientFailureSpecOf`）。
+			 */
+			function polishFail(message, spec) {
+				const snapshot = draft
+				setPhase('error')
+				setOriginal('')
+				setEnhanced('')
+				setErrorText(message)
+				errorDraftRef.current = snapshot
+				setStatus(message)
+				setFailure(spec)
+				try {
+					console.warn('[dsh-team-ops] 提示词增强失败：' + message)
+				} catch {
+					/* 控制台不可用也不影响输入框 */
+				}
+			}
+
+			/** 发一次提示词增强请求：成功后**直接 setDraft(enhanced)**，不弹浮窗。 */
+			function polishRun() {
+				if (busyRef.current) return
+				const textNow = draft
+				// 空草稿：**零请求、零提示**（task-7 第 3 条）。
+				if (polishCharsOf(textNow) === 0) return
+				if (typeof fetch !== 'function') {
+					polishFail('当前环境没有 fetch', polishClientFailureSpecOf('润色不可用', '当前环境没有 fetch，无法发送请求。', false))
+					return
+				}
+				busyRef.current = true
+				const id = requestNo.current + 1
+				requestNo.current = id
+				setPhase('requesting')
+				setStatus('')
+				const controller = typeof AbortController === 'function' ? new AbortController() : null
+				abortRef.current = controller
+				const body = { session: sessionId, text: textNow }
+				if (workspace !== '') body.workspace = workspace
+				// 撤回后紧接着的那一次：带 refresh:true，宿主跳过结果缓存真的再跑一次模型。
+				if (refreshNext.current === true) {
+					refreshNext.current = false
+					body.refresh = true
+				}
+				// 这一条 **不改任何一块读回的数据**（不落盘、不写账本、不进面板缓存）⇒ 没有可失效的东西；
+				// 面板那条"写动作附近必须 invalidatePanes"的扫描按 `POLISH_ENDPOINT` 认这一处豁免。
+				fetch(POLISH_ENDPOINT, {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify(body),
+					...(controller === null ? {} : { signal: controller.signal }),
+				})
+					.then((response) => response.json().then((data) => ({ response, data }), () => ({ response, data: null })))
+					.then(({ response, data }) => {
+						// 换会话 / 卸载之后迟到的响应一律丢弃（不拿旧结果覆盖新草稿）。
+						if (requestNo.current !== id) return
+						busyRef.current = false
+						abortRef.current = null
+						if (data !== null && data !== undefined && data.ok === true && typeof data.enhanced === 'string' && data.enhanced !== '') {
+							setOriginal(textNow)
+							setEnhanced(data.enhanced)
+							appliedRef.current = true
+							try {
+								setDraft(data.enhanced)
+							} catch (error) {
+								const message = '覆盖草稿失败：' + String(error !== null && error !== undefined && typeof error === 'object' && 'message' in error ? error.message : error)
+								polishFail(message, polishClientFailureSpecOf('无法写回输入框', message, false))
+								return
+							}
+							setErrorText('')
+							setPhase('enhanced')
+							setStatus('已增强。')
+							return
+						}
+						polishFail(polishFailureTextOf(response.status, data), polishFailureSpecOf(response.status, data))
+					})
+					.catch((error) => {
+						if (requestNo.current !== id) return
+						busyRef.current = false
+						abortRef.current = null
+						const message = String(error !== null && error !== undefined && typeof error === 'object' && 'message' in error ? error.message : error)
+						// abort 是"换会话 / 卸载"，不是失败。
+						if (/abort/i.test(message)) return
+						const detail = '发不出去：' + message
+						polishFail(detail, polishClientFailureSpecOf('请求没有发出去', detail, true))
+					})
+			}
+
+			/** 撤回：把增强前的原文写回输入框，按钮回到润色态。 */
+			function polishUndo() {
+				if (phase !== 'enhanced') return
+				if (setDraft === null) return
+				try {
+					setDraft(original)
+				} catch (error) {
+					const message = '撤回失败：' + String(error !== null && error !== undefined && typeof error === 'object' && 'message' in error ? error.message : error)
+					polishFail(message, polishClientFailureSpecOf('撤回失败', message, false))
+					return
+				}
+				refreshNext.current = true
+				setPhase('idle')
+				setOriginal('')
+				setEnhanced('')
+				setStatus('已撤回。')
+			}
+
+			// 失败态：草稿被人手动改了 ⇒ 收起失败态（不是拿旧错误吓人）。
+			React.useEffect(() => {
+				if (phase !== 'error') return
+				if (draft === errorDraftRef.current) return
+				setPhase('idle')
+				setErrorText('')
+			}, [draft, phase])
+			// 草稿被**手动改动**（≠ 刚增强出来的那份）⇒ 撤回失效，按钮回到润色态（task-7 第 4 条）。
+			React.useEffect(() => {
+				if (phase !== 'enhanced') return
+				// 草稿已经等于增强结果 ⇒ 撤回可用（并清掉"刚落盘"标记）。
+				if (draft === enhanced) {
+					appliedRef.current = false
+					return
+				}
+				// 刚落盘、宿主还没把新草稿推回来的那一帧：跳过，不误判成"人改了草稿"。
+				if (appliedRef.current === true) {
+					appliedRef.current = false
+					return
+				}
+				setPhase('idle')
+				setOriginal('')
+				setEnhanced('')
+			}, [draft, phase, enhanced])
+			// 失败态 **4 秒后自动收回润色态**（不弹提示条，也不会一直红着）。
+			React.useEffect(() => {
+				if (phase !== 'error') return undefined
+				const timer = setTimeout(() => {
+					setPhase('idle')
+					setErrorText('')
+				}, 4000)
+				if (typeof timer?.unref === 'function') {
+					try {
+						timer.unref()
+					} catch {
+						/* 忽略 */
+					}
+				}
+				return () => clearTimeout(timer)
+			}, [phase])
+			// 换会话：在途请求 abort、撤回态清掉（与「角色」席位同一条会话口径）。
+			React.useEffect(() => {
+				if (sessionRef.current === sessionId) return
+				sessionRef.current = sessionId
+				polishAbort()
+				setPhase('idle')
+				setOriginal('')
+				setEnhanced('')
+				setErrorText('')
+				setStatus('')
+				setFailure(null)
+			}, [sessionId])
+			// 卸载：abort（组件摘掉之后迟到的响应没有意义）。
+			React.useEffect(() => () => polishAbort(), [])
+
+			const chars = polishCharsOf(draft)
+			// **撤回只对"刚增强出来的那份文本"有效**（草稿改过就失效；effect 也会把状态收回去）。
+			const canUndo = phase === 'enhanced' && enhanced !== '' && draft === enhanced
+			const requesting = phase === 'requesting'
+			const errored = phase === 'error' && !canUndo && !requesting
+			const buttonState = canUndo ? 'enhanced' : requesting ? 'requesting' : errored ? 'error' : 'idle'
+			const label = canUndo ? '撤回润色' : errored ? '增强失败，点击重试' : '润色草稿'
+			const buttonTitle = canUndo ? '撤回润色' : errored ? '提示词增强失败：' + errorText : '润色草稿'
+
+			return el(
+				'div',
+				{ className: 'cbv-polish', key: 'polish' },
+				el(
+					'button',
+					{
+						key: 'polish-button',
+						className: 'cbv-composer-btn cbv-polish-btn' + (requesting ? ' cbv-polish-btn--busy' : '') + (errored ? ' cbv-polish-btn--error' : ''),
+						type: 'button',
+						'aria-label': label,
+						// 空草稿视觉禁用；**点了也不出网**（onClick 里先判空）。
+						'aria-disabled': chars === 0 && !canUndo ? 'true' : undefined,
+						// 请求中临时禁用（重复点击不重发；与 aria-disabled 的"条件不允许"语义分开）。
+						disabled: requesting,
+						title: buttonTitle,
+						'data-polish-state': buttonState,
+						'data-polish-button': '',
+						onClick: () => {
+							if (busyRef.current) return
+							if (canUndo) {
+								polishUndo()
+								return
+							}
+							polishRun()
+						},
+					},
+					canUndo ? polishUndoIconOf() : errored ? polishErrorIconOf() : polishIconOf(),
+				),
+				// 成功 / 撤回 / 失败都给读屏一句；失败另外有弹窗（见下），不再只靠按钮 title。
+				el('span', { key: 'status', className: 'cbv-sr-only', role: 'status', 'data-polish-status': '' }, status),
+				// 失败弹窗：复用 ⑩ 的 `ConfirmDialog`（Esc / 焦点圈闭 / 默认焦点都在那一份里）。
+				// **必须 portal 到 `document.body`**：这一席在宿主的 `conversation.input.right` 里，
+				// 已激活会话的 `.composerSeat` 带 `will-change: transform`（给后代造包含块）⇒
+				// `position:fixed` 的遮罩会相对输入框那一层，而不是视口（现场：弹窗贴着输入框、不居中）。
+				portalOf(el(ConfirmDialog, {
+					key: 'failure-dialog',
+					open: failure !== null,
+					slot: 'polish',
+					title: failure === null ? '' : failure.title,
+					lines: failure === null ? [] : failure.lines,
+					confirmLabel: failure === null ? '' : failure.confirmLabel,
+					onCancel: () => setFailure(null),
+					onConfirm: () => {
+						const retry = failure !== null && failure.retry === true
+						setFailure(null)
+						if (retry) polishRun()
+					},
+				})),
+			)
+		}
+		// 工厂与模块注册的闭合括号（⑯ 的尾部让位给本节：⑰ 必须仍在工厂函数体内）。
+	},
+})

@@ -1,0 +1,59 @@
+		// ── ① 种子、席位与防御 ────────────────────────────────────────────────
+		const seedError = { last: null }
+		const requireSeed = (name) => {
+			try {
+				return require(name)
+			} catch (error) {
+				seedError.last = error
+				return null
+			}
+		}
+
+		const React = requireSeed('react')
+
+		if (React === null) {
+			try {
+				console.warn('[dsh-team-ops] react 种子不可用，文件前端页已禁用：', seedError.last && seedError.last.message)
+			} catch {}
+			exports.apply = () => {}
+			return module.exports
+		}
+
+		/**
+		 * `react-dom` 种子 —— **只为一件事**：把输入框那一枚「角色」按钮的选择框 portal 到 `document.body`
+		 * （见下面 `portalOf`）。
+		 *
+		 * 为什么非它不可：选择框用 `position: fixed`，而它挂在宿主的 `conversation.input.left` 席位里，
+		 * 那一片在**已激活的会话**下会被本体自己的 `.composerSeat` 罩住 —— 那一层带
+		 * `will-change: transform`，于是给后代造了一个**包含块**：`fixed` 不再是"相对视口"，而是相对
+		 * 那层输入框。实测症状就是选择框整体右移、跟按钮对不上（`bottom` 恰好还落在差不多的位置，
+		 * 所以只错横轴，最容易看成"随机错位"）。宿主那份插槽契约里把这件事写死了：
+		 * `conversation.input.left` 的摘要原文是
+		 * "Compact controls at the left of the composer tool row; **fixed overlays must portal to the
+		 * document body because the docked composer contains them**." ⇒ 修法就是照它说的：portal 到 body。
+		 *
+		 * 拿不到这个种子（离线自检那套"穷人的 React"只喂 `react`）时返回 `null`，`portalOf` 会退化成就地
+		 * 渲染 —— 位置照算，只是照旧受包含块影响；**不许因此抛错**（工厂一抛会把整个 web shell 拖垮）。
+		 */
+		const ReactDOM = requireSeed('react-dom')
+
+		/**
+		 * 本插件的客户端 ctx —— `apply` 一进来就装在这里。
+		 *
+		 * 为什么要有这一格：取值帮手（`sessionsListStore` / `resolveCurrentSessionId` /
+		 * `subscribeCurrentSession`）与视图组件都定义在 `apply` **之外**（与本函数同级），
+		 * 而 `ctx` 只作为 `apply` 的形参存在。少了这一格，帮手里的 `ctx` 就是个**未声明变量**：
+		 * 读成 `undefined`、`.get` 抛错、被各自的兜底 catch 吞掉 —— 症状是**静默退化成"取不到会话"**
+		 * （面板不再跟当前会话的工作区/会话走），而且不报错、日志里一个字都没有。
+		 */
+		let clientCtx = null
+		/** 统一的服务取值：拿不到（还没 apply、或该服务不在）一律 `undefined`，不抛。 */
+		const serviceOf = (name) => {
+			try {
+				return clientCtx === null || typeof clientCtx.get !== 'function' ? undefined : clientCtx.get(name)
+			} catch {
+				return undefined
+			}
+		}
+
+		/** 与 host half 的 ROUTE_PATH 必须一致。 */

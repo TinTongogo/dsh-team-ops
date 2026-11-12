@@ -1,0 +1,799 @@
+		// ── ⑪ 角色触发源与输入框席位 ─────────────────────────────────────────────
+		const ROLE_SOURCE_ID = 'team-ops:roles'
+		// 本插件注册的来源名（`team-ops:roles:<分类>`）；引用 chip 只有来源注册过才插得进去（否则提交时报
+		// `slash: no serializer for reference source`）—— 这一格就是「能不能插引用」的闸。
+		const roleSourceState = { installed: false, names: new Set() }
+
+		/** 名册缓存：`@` 菜单随时可能被打开，别每敲一个字就打一次端点（短 TTL + 同一个工作区复用）。 */
+		const rosterCache = new Map()
+		/** **最后一次真读到的名册**（按 key 存）：热词典是**同步**函数，只能读这一份。 */
+		const rosterKnown = new Map()
+		// 当前 UI 正在看的（工作区|会话）名册 key：只从这一份算分组与热词典，
+		// 否则切到 B 工作区后，A 的角色还会从 `rosterKnown` 里漏进 @ 菜单。
+		let activeRosterKey = ''
+		/** 热词典的订阅者（名册变了要通知本体重新扫一遍纯文本引用）。 */
+		const lexiconSubs = new Set()
+
+		/**
+		 * 名册读回来之后：记下这一份 + 通知订阅者（热词典变了）。
+		 * @param key - 缓存 key。
+		 * @param rows - 名册行。
+		 * @returns {void}
+		 */
+		function rememberRoster(key, rows) {
+			rosterKnown.set(key, rows)
+			activeRosterKey = key
+			for (const emit of [...lexiconSubs]) {
+				try {
+					emit()
+				} catch {
+					// 订阅者自己抛异常不该影响取数
+				}
+			}
+		}
+
+		/**
+		 * **按 `category` 把已知名册分成几组**（人的口径：「@ 出来的角色，我们也要分组」）。
+		 *
+		 * 组的顺序 = 分类在名册里**第一次出现**的顺序（与面板那一节的选择框、卡片同序），不排序。
+		 * 没写分类的归到「未分类」。
+		 * @returns `[{ key, label, rows }]`：`key` 是来源标识用的稳定键（分类原文），`label` 是显示名。
+		 */
+		function roleGroupsOf() {
+			const groups = []
+			const seen = new Set()
+			// **只算当前名册**：`rosterKnown` 按工作区/会话累积，切走之后旧 key 不能继续漏进来。
+			const rows = rosterKnown.get(activeRosterKey) ?? []
+			for (const row of rows) {
+				const id = text(row?.role)
+				if (id === '' || seen.has(id)) continue
+				seen.add(id)
+				const label = text(row?.category) === '' ? '未分类' : text(row.category)
+				const group = groups.find((entry) => entry.label === label)
+				if (group === undefined) groups.push({ key: label, label: label, rows: [row] })
+				else group.rows.push(row)
+			}
+			return groups
+		}
+
+		/**
+		 * **热词典**要的那串名字：所有已知名册里的角色 id（去重）。
+		 * 同步、便宜（每敲一个字都会被问一次），读的是最近一次真读到的名册。
+		 * @returns 角色 id 数组（还没读到任何名册时是空数组）。
+		 */
+		function knownRoleNames() {
+			const names = new Set()
+			const rows = rosterKnown.get(activeRosterKey) ?? []
+			for (const row of rows) {
+				const id = text(row?.role)
+				if (id !== '') names.add(id)
+			}
+			return [...names]
+		}
+		/**
+		 * 取一份角色名册（现场枚举，来自本插件那个 `/members` 端点的 `defaults.rows`）。
+		 * @param workspace - 工作区绝对路径（从会话清单里读）。
+		 * @param sessionId - 会话 id（端点按它查本会话的 agent 名册）。
+		 * @returns `Promise<Array<object>>`：读不到就给空数组（菜单里就是"没有候选"，不编造）。
+		 */
+		function rosterRowsOf(workspace, sessionId) {
+			const key = workspace + '|' + sessionId
+			const hit = rosterCache.get(key)
+			if (hit !== undefined && Date.now() - hit.at < 5000) return hit.promise
+			// 返回 `{ rows, error }`：**读失败不再被吞成空数组**（设计 ⑩ `rosterRowsOf`）——
+			// 选择框要能把「没有角色」与「读不到名册」分开说。
+			const promise =
+				typeof fetch !== 'function'
+					? Promise.resolve({ rows: [], error: '当前环境没有 fetch' })
+					: getJsonCached(MEMBERS_ENDPOINT + (workspace === '' && sessionId === '' ? '' : paneQueryOf(workspace, sessionId)))
+							.then((response) =>
+								response.json().then(
+									(payload) => {
+										// **只认明确的失败**（`ok:false`）与"不是 JSON"：`ok` 缺省时按成功读
+										// —— 老宿主 / 自检桩件不一定带这一格，但 `defaults` 是这一条的正文。
+										if (payload === null || payload.ok === false) {
+											return { rows: [], error: payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }
+										}
+										const rows = payload.defaults !== undefined && payload.defaults !== null && Array.isArray(payload.defaults.rows) ? payload.defaults.rows : []
+										rememberRoster(key, rows)
+										return { rows, error: '' }
+									},
+									() => ({ rows: [], error: 'HTTP ' + response.status + '：响应不是 JSON' }),
+								),
+							)
+							.catch((error) => ({ rows: [], error: '读不到角色名册：' + String(error) }))
+			rosterCache.set(key, { at: Date.now(), promise: promise })
+			// 失败不留在 5 秒缓存里：否则「重试」会被缓存直接挡回去。
+			void promise.then((result) => {
+				if (result.error !== '') rosterCache.delete(key)
+			})
+			return promise
+		}
+
+		/**
+		 * 从**会话清单**里读那个会话的工作区（与视图栏那一席同一处口径；这里是纯函数版，供 `@` 菜单用）。
+		 * @param sessions - `sessions` 服务。
+		 * @param sessionId - 会话 id。
+		 * @returns 工作区绝对路径；读不到给空串。
+		 */
+		function workspaceOfSession(sessions, sessionId) {
+			try {
+				const snapshot = sessions?.list?.getSnapshot?.()
+				const entry = snapshot !== null && typeof snapshot === 'object' && snapshot.byId !== null && typeof snapshot.byId === 'object' ? snapshot.byId[sessionId] : undefined
+				const cwd = entry === null || entry === undefined ? undefined : entry.cwd
+				return typeof cwd === 'string' ? cwd : ''
+			} catch {
+				return ''
+			}
+		}
+
+		/**
+		 * **把角色加进本体的 `@` 菜单与热词典**（人的现场："我输入 @ 根本看不到任何团队内的角色"）。
+		 *
+		 * 这条路的出处同样是 `@michengai/dsh-agency-agents`（它就是这么把「专家」放进 `@` 菜单的）：
+		 * `ctx.inputTriggers.registerSource({ trigger, name, order, candidates, onPick, lexicon, codec })`。
+		 *   · `candidates(session, { query })` ⇒ `[{ name, hint, section }]`：菜单里的每一行；
+		 *   · `onPick({ candidate, session, span })` ⇒ `{ insert: <引用对象> }`：选中之后插一枚 chip；
+		 *   · `lexicon()` ⇒ 名字数组：**热词典**，直接打 `@qa` 也会被认成引用（不必先开菜单）；
+		 *   · `codec.clipboardText` / `serialize`：那枚 chip 在消息里长什么样（我们让它长成 `@角色名`）。
+		 * 拿不到 `inputTriggers` 服务（老宿主）就整段跳过：面板那一枚「角色」按钮照旧能用。
+		 * @param ctx - 客户端插件 ctx。
+		 * @param sessions - `sessions` 服务。
+		 * @returns 注销函数（没注册成功就是 no-op）。
+		 */
+		function registerRoleTriggerSource(ctx, sessions) {
+			const triggers = serviceOf('inputTriggers')
+			if (triggers === null || triggers === undefined || typeof triggers.registerSource !== 'function') return null
+			// `ctx.sessions` 在某些宿主 / 测试里不一定挂在这一格上 ⇒ 退到服务取值（老宿主没有它就是 undefined，
+			// 那时行为与从前一致：不折根会话）。
+			const sessionsService = sessions === undefined || sessions === null ? serviceOf('sessions') : sessions
+			/** 已经注册出去的来源：`分组 key → 注销函数`。 */
+			const registered = new Map()
+			/** 分组 key → 该组的来源 id（引用对象里的 `source` 必须与它逐字相等）。 */
+			const sourceIdOf = (key) => ROLE_SOURCE_ID + ':' + key
+			let warning = null
+
+			/** 一个分组的来源（照 dsh-agency-agents 的形状：**一组一个来源**，组标题写在 `section` 上）。 */
+			const sourceOf = (group) =>
+				({
+					trigger: '@',
+					name: sourceIdOf(group.key),
+					order: 120 + group.order,
+					showGroupTitle: false,
+					candidates: async (session) => {
+						// 子智能体对话里折到**根会话**：名册挂在领队那个会话上，子会话行连 cwd 都没有
+						// （不带工作区去取，宿主只能失败 —— 菜单就会"闪一下关掉"）。
+						const id = teamSessionIdOf(sessionsService?.list, text(session?.sessionId))
+						await rosterRowsOf(workspaceOfSession(sessionsService, id), id)
+						// 现取之后**按这一组过滤**（名册可能刚变过：不是这一组的就不出现在这里）。
+						const fresh = roleGroupsOf().find((entry) => entry.key === group.key)
+						return (fresh === undefined ? [] : fresh.rows).map((row) => ({
+							name: text(row.title) === '' ? text(row.role) : text(row.title),
+							hint: text(row.role),
+							section: group.label,
+						}))
+					},
+					onPick: ({ candidate }) => {
+						const id = text(candidate?.hint)
+						return {
+							insert: {
+								source: sourceIdOf(group.key),
+								ref: id,
+								label: text(candidate?.name),
+								appearance: 'session',
+								clipboardText: '@' + id + '\u00A0',
+							},
+						}
+					},
+					// 热词典：直接打 `@qa` 也算引用；必须**现取当前组**（闭包里的 `group.rows` 是注册时快照，同分类后加的角色会认不出）。
+					lexicon: () => {
+						const fresh = roleGroupsOf().find((entry) => entry.key === group.key)
+						return (fresh?.rows ?? []).map((row) => text(row?.role)).filter((name) => name !== '')
+					},
+					subscribeLexicon: (emit) => {
+						lexiconSubs.add(emit)
+						return () => lexiconSubs.delete(emit)
+					},
+					codec: {
+						clipboardText: (ref) => '@' + text(ref) + '\u00A0',
+						serialize: async (ref) => '@' + text(ref) + '\u00A0',
+					},
+				})
+
+			/** 名册读到哪一组就补哪一组（分类后来才出现的组，下一次名册变化时补上）。 */
+			const sync = () => {
+				for (const group of roleGroupsOf()) {
+					if (registered.has(group.key)) continue
+					try {
+						const dispose = triggers.registerSource(sourceOf({ ...group, order: registered.size }))
+						registered.set(group.key, typeof dispose === 'function' ? dispose : () => {})
+						roleSourceState.installed = true
+						roleSourceState.names.add(sourceIdOf(group.key))
+					} catch (error) {
+						if (warning === null) {
+							warning = 'team-ops：角色进不了 `@` 菜单（' + String(error === null || error === undefined ? '未知错误' : error.message ?? error) + '）—— 面板那枚「角色」按钮仍可用。'
+							ctx?.logger?.warn?.(warning)
+						}
+					}
+				}
+			}
+
+			// 名册变化 ⇒ 一是补新组，二是通知本体重扫热词典。
+			lexiconSubs.add(sync)
+			// 先预热一份：分组与热词典都读"最近一次真读到的名册"，没人开过菜单时也得有一份。
+			const current = teamSessionIdOf(sessionsService?.list, resolveCurrentSessionId())
+			void rosterRowsOf(workspaceOfSession(sessionsService, current), current).then(() => sync())
+
+			return () => {
+				lexiconSubs.delete(sync)
+				for (const dispose of registered.values()) dispose()
+				registered.clear()
+				roleSourceState.installed = false
+				roleSourceState.names.clear()
+			}
+		}
+
+		/**
+		 * **把草稿折成 detect 投影**（chip 各算一个 `U+FFFC`）。
+		 *
+		 * 本体的插入 API（`insertReference` / `insertText` 的 `span`）吃的是**这套坐标**，不是"chip 展开了
+		 * 的那种文本"的偏移：快照里的 `draft` 是**展开文本**（一枚 chip 展开成 `@qa␣`），而 `occurrences`
+		 * 给出每一枚 chip 在那份文本里的 `{ offset, length }`。照 `dsh-agency-agents` 的 `mO()` 折一遍，
+		 * 偏移才对得上（**这一处曾经算错坐标 ⇒ 选第二个角色时插入静默失败、输入框里只有第一个**）。
+		 * @param draftText - 快照里的 `draft`（展开文本）。
+		 * @param occurrences - 快照里的 `occurrences`（chip 的位置与长度）。
+		 * @returns detect 文本。
+		 */
+		function detectTextOf(draftText, occurrences) {
+			let out = text(draftText)
+			const list = Array.isArray(occurrences) ? occurrences : []
+			// 从后往前替换，前面的偏移才不受影响。
+			const sorted = [...list].sort((a, b) => ((b?.offset ?? 0) - (a?.offset ?? 0)))
+			for (const item of sorted) {
+				const offset = item?.offset
+				const length = item?.length ?? 1
+				if (typeof offset !== 'number' || offset < 0 || length < 1 || offset + length > out.length) continue
+				out = out.slice(0, offset) + '\uFFFC' + out.slice(offset + length)
+			}
+			return out
+		}
+
+		/**
+		 * **输入框那个把手**（插字 / 插引用 / 通知的唯一入口）。
+		 *
+		 * 这条路的出处：`@michengai/dsh-agency-agents` 的客户端就是这么把「专家」插进输入框的 ——
+		 * 它从**会话作用域**里取 `conversation` 服务，再 `.input.for(scope)` 拿到一个把手：
+		 *   · `handle.state.getSnapshot()` ⇒ `{ draft, draftRev, occurrences }`（detect 坐标，chip 各算一个字符）；
+		 *   · `handle.insertText(text, span)` / `handle.insertReference(ref, span)` / `handle.notify(level, text)`；
+		 *   · 或者走事件面：`scope.bail(scope, 'slash/input-insert-text', { text, span, continue? })`。
+		 * **它就是"改草稿"的正路**：不像 `inputActions.setDraft` 那样整份替换（那会把已经插进来的 chip 冲掉）。
+		 * @param sessions - `sessions` 服务（客户端插件 ctx 上那个，`inject` 里已点名）。
+		 * @param sessionId - 会话 id。
+		 * @returns `{ scope, handle, scopeId }`；拿不到时 `scope` 为 null。
+		 */
+		function composerAccessOf(sessions, sessionId) {
+			const none = { scope: null, handle: null }
+			try {
+				if (sessions === null || sessions === undefined || sessionId === '') return none
+				const id =
+					typeof sessions.list?.getSnapshot === 'function'
+						? (() => {
+								const snapshot = sessions.list.getSnapshot()
+								const byId = snapshot === null || typeof snapshot !== 'object' ? undefined : snapshot.byId
+								if (typeof snapshot?.current === 'string' && snapshot.current !== '') return snapshot.current
+								if (byId !== null && typeof byId === 'object') {
+									const hit = Object.entries(byId).find(([, entry]) => ((entry?.retainedBy?.mainView ?? 0) > 0))
+									if (hit !== undefined) return hit[1]?.id ?? hit[0]
+								}
+								return sessionId
+							})()
+						: sessionId
+				const scope = typeof sessions.scope === 'function' ? sessions.scope(id) : typeof sessions.binding === 'function' ? sessions.binding(id)?.ctx : undefined
+				if (scope === undefined || scope === null) return none
+				const handle = typeof scope.get === 'function' ? scope.get('conversation')?.input?.for?.(scope) : undefined
+				return { scope: scope, handle: handle === undefined || handle === null ? null : handle }
+			} catch {
+				return none
+			}
+		}
+
+		/**
+		 * 「角色」选择框里把焦点挪到相邻一行（↑ ↓ 用）。
+		 *
+		 * 为什么要自己挪：行是 `div role="option"`（不是原生 `<select>`），浏览器不会替我们移动焦点。
+		 * 从**事件目标**往上找 `[data-composer-role-list]` 那一层，再在它里面按 `data-composer-role-id`
+		 * 取全部行 —— 不依赖 `document` 查询；拿不到 DOM（非浏览器环境）时安静地不动。
+		 * @param from - 当前聚焦的那一行（事件的 `currentTarget`）。
+		 * @param step - `+1` 下一行 / `-1` 上一行。
+		 */
+		const movePickerFocus = (from, step) => {
+			try {
+				if (from === null || from === undefined || typeof from.closest !== 'function') return
+				const list = from.closest('[data-composer-role-list]')
+				if (list === null || list === undefined || typeof list.querySelectorAll !== 'function') return
+				const options = Array.from(list.querySelectorAll('[data-composer-role-id]'))
+				const at = options.indexOf(from)
+				if (at < 0) return
+				const next = options[at + step]
+				if (next !== undefined && next !== null && typeof next.focus === 'function') next.focus()
+			} catch {
+				/* 拿不到 DOM 就算了：键盘这一步失败不该影响别的 */
+			}
+		}
+
+		/**
+		 * 「角色」选择框的落点（**视口坐标**，单位 px）—— 纯函数，DOM 由调用方量。
+		 *
+		 * 一行算式各管一件事：
+		 *   · `left` = 按钮左边缘（选择框与按钮**左对齐**）；右边放不下就往左收，
+		 *     收的程度按选择框**真实外框**算：`min(300px, 70vw)` 的内容宽 + 左右内边距 12 + 边框 2 = 314
+		 *     （这层是 content-box，见 `.cbv-rolepick-pop` 那条样式）。原来的 428 是 420px 宽那一版的
+		 *     遗产，选择框收窄到 300 之后这个数就没再生效过，还留着一并按真实宽度改掉。
+		 *   · `bottom` = 视口底到按钮上边缘再抬 8px ⇒ 选择框**浮在输入框上方**，不压住输入框那一行。
+		 * 两种情形都至少离视口边 8px：窗口再窄也不贴边。
+		 * @param rect - 按钮的 `getBoundingClientRect()` 读数（只要 `left` / `top`）。
+		 * @param viewport - `{ width, height }`（`window.innerWidth` / `innerHeight`）。
+		 * @returns `{ left, bottom }`，直接进 `style`。
+		 */
+		const rolePickerPlacement = (rect, viewport) => {
+			const width = Math.min(300, viewport.width * 0.7) + 14
+			const left = Math.max(8, Math.min(rect.left, viewport.width - width - 8))
+			const bottom = Math.max(8, viewport.height - rect.top + 8)
+			return { left: Math.round(left), bottom: Math.round(bottom) }
+		}
+
+		/**
+		 * **输入框工具行里那一枚「角色」按钮**（席位 `conversation.input.left`）。
+		 *
+		 * 人的口径：「我的意思是在输入框添加一个「角色」按钮」「**角色就长在输入框文本里，只需要输入框
+		 * `@+对应角色名` 就可以了**」「在输入框直接清除内容就可以取消角色生效了」。
+		 * 于是这里只有两步，没有第三步：
+		 *   ① 点「角色」⇒ 一个选择框（搜索 + 按分类分组 + 头像行，与本体那个「专家」选择框同形）；
+		 *   ② 选中一个角色 ⇒ 把 **`@<角色名>` 追加进输入框**（已有标记时不替换，所以可以连着点几个）（走本体那条 `slash/input-insert-text` 事件面，
+		 *      与 `@michengai/dsh-agency-agents` 插「专家」是同一个把手）；在输入框接着写这件活，
+		 *      **按发送**就行 —— 消息里那个 `@角色名` 就是"点名"，协调者会按规矩把这件事交给那个角色
+		 *      （`member_spawn` / `member_send`）。面板**自己不发任何派活请求**（人的判断：本体的发送键
+		 *      就够了，再挂一枚"让它去干"是重复入口）。
+		 * **角色不是一份状态，而是草稿的函数**：文本里那个 `@<名册里认得的角色名>` 在，角色就在；
+		 * 删掉那段文本（或者把输入框清空）角色自动不作数 —— 这正好就是"取消"。
+		 *
+		 * 三条不肯猜的地方：
+		 *   · **草稿从标准 prop `useInput` 读**（`s.draft`，本体自己也是这么读的），**清空走 `inputActions.setDraft('')`**
+		 *     —— 不自己抓 DOM、不伪造一份草稿状态。
+		 *   · **工作区从会话读**（`useSessions(s => s.byId[sessionId]?.cwd)`，与视图栏那一席同一处口径）。
+		 *   · **能不能叫、叫什么名字、记哪一行**全由引擎说了算：端点拒了就把那句话原样显示在选择框里，
+		 *     按钮留在"让 <角色> 去做"上，改一改再来。
+		 *
+		 * @param props - 槽给的标准 props：`useInput` / `inputActions` / `sessionId` / `useSessions`（都可能有旧版本）。
+		 * @returns 一枚按钮 + 展开时的选择框。
+		 */
+		function RoleComposerEntry(props) {
+			const slotsProps = props === null || props === undefined ? {} : props
+			// `sessions`：插件 ctx 上那个服务（席位注册时塞进来 —— 会话作用域里的 `conversation` 把手要它）。
+			const sessionsService = slotsProps.sessions === undefined || slotsProps.sessions === null ? serviceOf('sessions') : slotsProps.sessions
+			const sessionId = typeof slotsProps.sessionId === 'string' ? slotsProps.sessionId : resolveCurrentSessionId()
+			// 子智能体对话里折到**根会话**（名册与角色源都挂在领队那个会话上）。
+			const teamSessionId = teamSessionIdOf(sessionsService?.list, sessionId)
+			// 草稿：本体自己的读法（`useInput((s) => s)`）—— 取不到就当空串（旧宿主没有这个 prop）。
+			const inputState = typeof slotsProps.useInput === 'function' ? slotsProps.useInput((state) => state) : null
+			const draft = inputState === null || inputState === undefined ? '' : text(inputState.draft)
+			const setDraft = typeof slotsProps.inputActions === 'object' && slotsProps.inputActions !== null && typeof slotsProps.inputActions.setDraft === 'function' ? slotsProps.inputActions.setDraft : null
+			// 工作区：与视图栏那一席同一处口径（会话清单里**团队会话那一条**的 cwd）。
+			const workspace = typeof slotsProps.useSessions === 'function' ? text(slotsProps.useSessions((state) => (teamSessionId === '' || state === null || state === undefined || typeof state.byId !== 'object' || state.byId === null ? undefined : state.byId[teamSessionId]?.cwd))) : ''
+			// 没有 `useSessions` 的旧宿主：从会话清单直接读（同样是团队会话那一行）。
+			const workspaceNow = workspace !== '' ? workspace : workspaceOfSession(sessionsService, teamSessionId)
+			/**
+			 * **从草稿里读角色**（人的口径：「角色就长在输入框文本里只需要输入框「@+对应角色名」就可以了」）。
+			 *
+			 * 于是角色不是一份独立状态，而是**草稿的函数**：输入框里有几个 `@<角色名>` 就有几个角色
+			 * （**可以同时 @ 好几个**），删掉那几段（或者整份清空）就自动没有 —— 这正好也是"取消"。
+			 * 只在**名册里认识这个名字**时才算数（`rosterIds`）：`@某文档` 那种写法不会被当成角色。
+			 * @param text_ - 草稿（detect 投影，chip 各占一个 U+FFFC）。
+			 * @param ids - 名册里的角色 id（还没读到名册时为空 ⇒ 先不认，读到之后自动生效）。
+			 * @returns `{ roles, task, lastEnd }`：点到的角色 id（按出现顺序、去重）、去掉全部标记之后的
+			 *   那件事、以及最后一个标记的结束位置（面板那枚按钮要"追加"在它之后）。
+			 */
+			const rolesInDraftOf = (text_, ids) => {
+				const source = text(text_)
+				const roles = []
+				const cuts = []
+				const pattern = /(^|\s)@([a-z][a-z0-9-]*)/g
+				let match = pattern.exec(source)
+				while (match !== null) {
+					const name = match[2]
+					if (ids.includes(name) && !roles.includes(name)) {
+						const start = match.index + match[1].length
+						const end = start + name.length + 1
+						// 标记后面若紧跟一个空白（chip 自带一个不换行空格），一起吃掉 —— 免得任务开头留空。
+						const tail = /^\s/.test(source.slice(end, end + 1)) ? 1 : 0
+						roles.push(name)
+						cuts.push({ start: start, end: end + tail })
+					}
+					match = pattern.exec(source)
+				}
+				if (roles.length === 0) return { roles: [], task: source.trim(), lastEnd: 0 }
+				let task = ''
+				let at = 0
+				for (const cut of cuts) {
+					task += source.slice(at, cut.start)
+					at = cut.end
+				}
+				task += source.slice(at)
+				return { roles: roles, task: task.trim(), lastEnd: cuts[cuts.length - 1].end }
+			}
+
+			const [open, setOpen] = React.useState(false)
+			// 选择框浮在输入框上方：`position:fixed` + portal 到 body ⇒ 这两个数是视口坐标；拿不到 DOM 时退回保守位置。
+			const [popAt, setPopAt] = React.useState({ left: 12, bottom: 64 })
+			const buttonRef = React.useRef(null)
+			const popRef = React.useRef(null)
+			const [query, setQuery] = React.useState('')
+			const [rows, setRows] = React.useState(null)
+			// 名册读失败的原因（与"读到且 0 个角色"分开，设计 4.5）；插入失败时也**不关窗**，给可复制提示。
+			const [rosterError, setRosterError] = React.useState('')
+			const [insertError, setInsertError] = React.useState(null)
+			// 名册里的角色 id（认得 `@名字` 的那些）—— 读到名册之前是空的：先不认，读到之后自动生效。
+			const rosterIds = React.useMemo(() => (rows ?? []).map((entry) => text(entry.role)).filter((id) => id !== ''), [rows])
+			const marker = rolesInDraftOf(draft, rosterIds)
+			/** 文本里点到的角色（**可以多个**：`@qa @fe-dev 一起看看`）。 */
+			const roles = marker.roles
+
+			// 打开时（以及打开着的时候换会话）现取一次名册：**现场枚举**，面板上刚加的角色马上叫得动。
+			const needRoster = open || /(^|\s)@[a-z]/.test(draft)
+			React.useEffect(() => {
+				if (!needRoster || rows !== null) return undefined
+				let alive = true
+				// 与 `@` 菜单、热词典共用同一份带缓存的取数（同一处口径，也省一次往返）。
+				rosterRowsOf(workspaceNow, teamSessionId).then((result) => {
+					if (!alive) return
+					setRows(result.rows)
+					setRosterError(text(result.error))
+				})
+				return () => {
+					alive = false
+				}
+			}, [needRoster, rows, workspaceNow, teamSessionId])
+
+			// 打开时量一次按钮位置（窗口尺寸变化重算）；量的是按钮、改的是视口坐标，不会被 `.composerSeat` 的包含块带偏。
+			React.useEffect(() => {
+				if (!open) return undefined
+				const place = () => {
+					const node = buttonRef.current
+					if (node === null || node === undefined || typeof node.getBoundingClientRect !== 'function') return
+					const rect = node.getBoundingClientRect()
+					const inn = typeof window === 'undefined' ? null : window
+					const viewport = {
+						width: typeof inn?.innerWidth === 'number' ? inn.innerWidth : 1200,
+						height: typeof inn?.innerHeight === 'number' ? inn.innerHeight : 800,
+					}
+					setPopAt(rolePickerPlacement(rect, viewport))
+				}
+				place()
+				if (typeof window.addEventListener !== 'function') return undefined
+				window.addEventListener('resize', place)
+				return () => window.removeEventListener('resize', place)
+			}, [open])
+
+			// 失去焦点就关：点在按钮与选择框之外立刻收起；用 capture 阶段听 `pointerdown`，别的组件 stopPropagation 也收得到。
+			React.useEffect(() => {
+				if (!open) return undefined
+				const inside = (node) => {
+					if (node === null || node === undefined) return false
+					const pop = popRef.current
+					const button = buttonRef.current
+					for (const target of [pop, button]) {
+						if (target !== null && target !== undefined && typeof target.contains === 'function' && target.contains(node)) return true
+					}
+					return false
+				}
+				const onDown = (event) => {
+					if (inside(event.target)) return
+					setOpen(false)
+				}
+				document.addEventListener('pointerdown', onDown, true)
+				return () => document.removeEventListener('pointerdown', onDown, true)
+			}, [open])
+
+			// Esc 关选择框（集中在输入框这一处，不打扰别处）。
+			React.useEffect(() => {
+				if (!open) return undefined
+				const onKey = (event) => {
+					// 不 preventDefault：Escape 在浏览器里没有默认动作，`preventDefault` 会改掉别的组件对同一按键的行为；只收起自己。
+					if (event.key !== 'Escape') return
+					setOpen(false)
+					// Esc 关闭后把焦点还给「角色」按钮（设计 4.5 / A-07）。
+					try {
+						const node = buttonRef.current
+						if (node !== null && node !== undefined && typeof node.focus === 'function') node.focus()
+					} catch {}
+				}
+				document.addEventListener('keydown', onKey)
+				return () => document.removeEventListener('keydown', onKey)
+			}, [open])
+
+			// 键盘之外还有一条"失焦"：焦点移到选择框与按钮之外（Tab 走掉、点进别的输入）⇒ 同样收起。
+			React.useEffect(() => {
+				if (!open) return undefined
+				const onFocusOut = (event) => {
+					const next = event.relatedTarget
+					const pop = popRef.current
+					const button = buttonRef.current
+					for (const target of [pop, button]) {
+						if (target !== null && target !== undefined && typeof target.contains === 'function' && (next === null || next === undefined || target.contains(next))) return
+					}
+					setOpen(false)
+				}
+				document.addEventListener('focusout', onFocusOut)
+				return () => document.removeEventListener('focusout', onFocusOut)
+			}, [open])
+
+			// 「清空输入框 = 取消角色」现在**是结构上的事实**：角色就是草稿里的 `@角色名`，
+			// 文本没了角色就没了 —— 不需要额外一条状态去同步（原来那条 effect 撤掉了）。
+
+			/**
+			 * **把 `@<角色名>` 插进输入框**（人的口径：角色就长在输入框文本里）。
+			 *
+			 * 三级回落，一级比一级保守：
+			 *   ① 会话作用域里的 `conversation` 把手 ⇒ `scope.bail(scope, 'slash/input-insert-text', { text, span })`
+			 *      （**正路**，与本体自己插字同一条；离光标最近的插入点 = 我们算的那个 span）；
+			 *   ② 退而用把手自己的 `insertText`（同一件事的直调形式）；
+			 *   ③ 都没有 ⇒ **只有在草稿是空的时候**才用 `inputActions.setDraft`（空草稿没有 chip 可被冲掉）。
+			 * 三者都不行就返回 false：调用方照实提示"请自己打 `@角色名`"（不假装插进去了）。
+			 * @param name - 角色 id。
+			 * @returns 真的插进去了吗。
+			 */
+			const insertMarker = (name, category, label) => {
+				const markerText = '@' + name + ' '
+				// 引用对象的 `source` 必须与**那一组注册出去的来源**逐字相等（分组：一组一个来源）。
+				const sourceId = ROLE_SOURCE_ID + ':' + (text(category) === '' ? '未分类' : text(category))
+				const access = composerAccessOf(sessionsService, sessionId)
+				const snapshot = typeof access.handle?.state?.getSnapshot === 'function' ? access.handle.state.getSnapshot() : null
+				const draftRev = snapshot === null || snapshot === undefined ? undefined : snapshot.draftRev
+				const source = snapshot === null || snapshot === undefined ? '' : text(snapshot.draft)
+				// **插入点按 detect 坐标算**（chip = 一个 `U+FFFC`）：开头那一串"已有的点名"之后。
+				// 已有的点名有两种形态：本体插的 chip（detect 里是 `U+FFFC`）与我们退而插的纯文本（`@名字`）。
+				const detect = detectTextOf(source, snapshot === null || snapshot === undefined ? null : snapshot.occurrences)
+				const opener = /^(?:\s*(?:\uFFFC|@[a-z][a-z0-9-]*)\s*)*/u.exec(detect)
+				const at = opener === null ? { start: 0, end: 0 } : { start: opener[0].length, end: opener[0].length }
+				const span = draftRev === undefined ? null : { start: at.start, end: at.end, draftRev: draftRev }
+				if (span !== null && access.scope !== null && typeof access.scope.bail === 'function') {
+					// ① 先试插引用（chip 显示中文名、文本 `@角色名`）；来源没注册过就退成纯文本，绝不把坏 chip 塞进草稿。
+					if (roleSourceState.names.has(sourceId)) {
+						try {
+							const reference = { source: sourceId, ref: name, label: label === '' ? name : label, appearance: 'session', clipboardText: markerText.trimEnd() + '\u00A0' }
+							if (access.scope.bail(access.scope, 'slash/input-insert-reference', { reference: reference, span: span }) === true) return true
+						} catch {
+							// 旧宿主没有这条事件 ⇒ 落到下一级
+						}
+					}
+					// ② 退一步：插**纯文本**（同一处把手，同样不冲掉别人的 chip）。
+					try {
+						if (access.scope.bail(access.scope, 'slash/input-insert-text', { text: markerText, span: span }) === true) return true
+					} catch {
+						// 同上
+					}
+				}
+				if (span !== null && typeof access.handle?.insertText === 'function') {
+					try {
+						if (access.handle.insertText(markerText, span) === true) return true
+					} catch {
+						// 同上
+					}
+				}
+				if (detect.trim() === '' && setDraft !== null) {
+					setDraft(markerText)
+					return true
+				}
+				// 三级都不行：**说一句**（本体的通知面；静默失败会让人以为"选了没反应"）。
+				// 这句走的是**宿主的通知面**（纯文本，没有 markdown 渲染）⇒ 不写反引号，直接给那串该打的东西。
+				try {
+					access.handle?.notify?.('error', '这个会话插不进输入框：自己在输入框打 @' + name + ' 也一样。')
+				} catch {
+					// 通知面也没有（更老的宿主）⇒ 只能作罢
+				}
+				return false
+			}
+
+			// **不再有"让它去干"那枚动作**（人的判断：本体的发送键就够了 —— `@角色名` 是一枚真 chip，
+			// 会原样进消息，那件事由协调者按"点名"那条规矩派下去；再挂一枚按钮就是重复入口）。
+
+			const entries = rows ?? []
+			const needle = query.trim().toLowerCase()
+			const matched = entries.filter((entry) =>
+				needle === '' ? true : [text(entry.role), text(entry.title), text(entry.category), text(entry.positioning)].map((value) => value.toLowerCase()).some((value) => value.includes(needle)),
+			)
+			const groups = []
+			for (const entry of matched) {
+				const key = text(entry.category) === '' ? '（未分类）' : text(entry.category)
+				const group = groups.find((bucket) => bucket.key === key)
+				if (group === undefined) groups.push({ key: key, rows: [entry] })
+				else group.rows.push(entry)
+			}
+
+			// 按钮永远叫「角色」（选中角色不显示在按钮上，否则没法再选/取消）；选中的显示在旁边小片上：
+			// 点正文 = 让它去干，点 `×` = 取消；输入框被清空时也不作数。
+			return el(
+				'div',
+				{ className: 'cbv-rolepick', key: 'rolepick' },
+				el(
+					'button',
+					{
+						className: 'cbv-composer-btn',
+						key: 'pick',
+						type: 'button',
+						ref: buttonRef,
+						'aria-expanded': open ? 'true' : 'false',
+						'aria-controls': 'cbv-rolepick-pop',
+						'data-composer-role': roles.join(' '),
+						onClick: () => setOpen((value) => !value),
+					},
+					// 一枚图标（人的指令：「另外给角色配置一个图标」）：与头像用同一套描边几何。
+					el('span', { className: 'cbv-composer-btn-icon', key: 'icon', 'aria-hidden': 'true' }, avatarIconOf('user')),
+					'角色',
+				),
+				!open
+					? null
+					// portal 到 `document.body`：就地渲染会落在宿主输入框的包含块里，`fixed` 被带偏（现场"选择框右移、跟按钮对不上"）。
+					: portalOf(el(
+							'div',
+							{
+								id: 'cbv-rolepick-pop',
+								className: 'cbv-rolepick-pop',
+								key: 'pop',
+								role: 'dialog',
+								'aria-label': '选一个角色',
+								ref: popRef,
+								style: { left: popAt.left + 'px', bottom: popAt.bottom + 'px' },
+							},
+						el(
+							'div',
+							{ className: 'cbv-rolepick-head', key: 'head' },
+							el('input', {
+									className: 'cbv-rolepick-search',
+									key: 'search',
+									type: 'text',
+									'data-composer-role-field': 'search',
+									value: query,
+									placeholder: '搜索角色名称、分类或关键词',
+									autoFocus: true,
+									onChange: (event) => setQuery(event.target.value),
+							}),
+						),
+							el(
+								'div',
+								{
+									className: 'cbv-picker',
+									key: 'list',
+									role: 'listbox',
+									'data-composer-role-list': '' + matched.length,
+									'data-composer-phase': rows === null ? 'loading' : rosterError !== '' ? 'error' : rows.length === 0 ? 'empty' : matched.length === 0 ? 'filtered' : 'ready',
+								},
+								rows === null
+									? // 加载：3 行骨架（头像圆 + 一行短条），`aria-busy`；不显示「没有匹配」。
+										el(
+											'div',
+											{ className: 'cbv-picker-skel', key: 'loading', 'aria-busy': 'true' },
+											el('span', { className: 'cbv-sr-only', key: 'say' }, '正在读取角色名册…'),
+											[0, 1, 2].map((index) =>
+												el(
+													'span',
+													{ className: 'cbv-picker-skel-row', key: 'r' + index, 'aria-hidden': 'true' },
+													el('span', { className: 'cbv-skel-avatar', key: 'av' }),
+													el('span', { className: 'cbv-skel-line', key: 'line' }),
+												),
+											),
+										)
+									: rosterError !== ''
+										? el(
+												'div',
+												{ className: 'cbv-pane-empty', key: 'error', 'data-composer-error': '' },
+												'读不到角色名册：' + rosterError,
+												el(
+													'button',
+													{
+														className: 'cbv-btn',
+														key: 'retry',
+														type: 'button',
+														'data-composer-retry': '',
+														onClick: () => {
+															setRosterError('')
+															setRows(null)
+														},
+													},
+													'重试',
+												),
+											)
+										: rows.length === 0
+											? el(
+													'div',
+													{ className: 'cbv-pane-empty', key: 'empty', 'data-composer-empty': '' },
+													el('div', { key: 'say1' }, '角色目录里还没有角色。'),
+													el('div', { key: 'say2', className: 'cbv-mp-field-note' }, '在「角色」块添加后，这里立刻能选。'),
+												)
+											: matched.length === 0
+												? el(
+														'div',
+														{ className: 'cbv-pane-empty', key: 'none' },
+														'没有匹配的角色。',
+														el('button', { className: 'cbv-btn', key: 'clear', type: 'button', 'data-composer-clear-search': '', onClick: () => setQuery('') }, '清除搜索'),
+													)
+										: groups.map((group) =>
+												el(
+													'div',
+													{ className: 'cbv-picker-group', key: group.key },
+													el('div', { className: 'cbv-picker-head', key: 'head' }, group.key),
+													group.rows.map((entry) => {
+														const id = text(entry.role)
+														/**
+														 * 选中一行：把 `@角色名` 写进输入框 —— 角色从此长在文本里，改/删都由你。
+														 * 插不进去（旧宿主没有本体那套输入服务）就**照实说**：关窗，提示自己打 `@角色名`
+														 * —— 不假装插进去了。`onClick` 与键盘 Enter / Space 走**同一段**。
+														 */
+														const activate = () => {
+															// **插入成功才关窗**（设计 4.5 / A-20）：失败时选择框留着，行下方给可复制的提示。
+															const inserted = insertMarker(id, text(entry.category), text(entry.title))
+															if (inserted) {
+																setInsertError(null)
+																setOpen(false)
+																return
+															}
+															setInsertError(id)
+														}
+														return el(
+															'div',
+															{
+																className: 'cbv-picker-row' + (roles.includes(id) ? ' cbv-picker-row--on' : ''),
+																key: id,
+																role: 'option',
+																tabIndex: 0,
+																'aria-selected': roles.includes(id) ? 'true' : 'false',
+																'data-composer-role-id': id,
+																onClick: activate,
+																// 行是 `div`（浏览器对它没有内建的激活行为）⇒ 只绑 `onClick` 对纯键盘的人是死路。
+																// Enter / Space = 选中；↑ ↓ = 把焦点挪到相邻一行。
+																onKeyDown: (event) => {
+																	if (event === null || event === undefined) return
+																	if (event.key === 'Enter' || event.key === ' ') {
+																		event.preventDefault()
+																		activate()
+																		return
+																	}
+																	if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+																	event.preventDefault()
+																	movePickerFocus(event.currentTarget, event.key === 'ArrowDown' ? 1 : -1)
+																},
+															},
+															el('span', { className: 'cbv-mp-avatar cbv-mp-avatar--' + (text(entry.avatarTone) === '' ? 'exec' : text(entry.avatarTone)), key: 'av', 'aria-hidden': 'true' }, avatarIconOf(entry.avatar)),
+															// **只留角色图标 + 角色名**（人的指令）：分类由上面的组标题给，
+															// id / 定位句 / "已在场"这些都不印 —— 一行一角色，扫得快。
+															el('span', { className: 'cbv-picker-text', key: 'text' }, el('span', { className: 'cbv-picker-name', key: 'name' }, text(entry.title) === '' ? text(entry.role) : text(entry.title))),
+														)
+													}),
+												),
+											),
+							),
+							// 插入失败：**不关窗**、给可复制的同一串（设计 4.5 / A-20）。
+							insertError === null
+								? null
+								: el(
+										'div',
+										{ className: 'cbv-pane-empty cbv-picker-insert-error', key: 'insert-error', 'data-composer-insert-error': insertError },
+										el('div', { key: 'say' }, '这个会话插不进输入框：自己在输入框打 @' + insertError + ' 也一样。'),
+										el(
+											'button',
+											{
+												className: 'cbv-btn',
+												key: 'copy',
+												type: 'button',
+												'data-composer-copy-marker': insertError,
+												onClick: () => {
+													void copyText('@' + insertError + ' ')
+												},
+											},
+											'复制 @' + insertError,
+										),
+									),
+						)),
+			)
+		}
+

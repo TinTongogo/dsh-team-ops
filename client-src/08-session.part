@@ -1,0 +1,424 @@
+		// ── ⑧ 会话、工作区与高度 ───────────────────────────────────────────────
+		function sessionsListStore() {
+			try {
+				const service = serviceOf('sessions')
+				if (service === null || service === undefined) return null
+				return service.list === null || service.list === undefined ? null : service.list
+			} catch {
+				return null
+			}
+		}
+
+		/**
+		 * 当前会话 id 的**四级回落**。
+		 *
+		 * 为什么不能只读一个字段：宿主 0.2.x 的会话清单 store 里**没有 `current`**
+		 * （现场报的「请求里没带 workspace 参数」就是按老形态读 `snapshot.current` 读出来的空串），
+		 * "当前是哪个会话"这件事在客户端由 `uiSession` 的**主绑定**持有。四级按权威度排：
+		 *   ① `uiSession.current`（客户端权威：主视图正在显示的那个会话）；
+		 *   ② 清单里 `retainedBy.mainView > 0` 的第一行（与宿主 `uiSession.publishMain` 同一条判定）；
+		 *   ③ 老形态 `snapshot.current`（宿主 store 自己带它时）；
+		 *   ④ 清单里**只有一个**会话时才用它 —— 多于一个**不猜**（猜错工作区比报错更坏）。
+		 * @returns 会话 id；取不到时为空串。
+		 */
+		function resolveCurrentSessionId() {
+			let snapshot = null
+			const list = sessionsListStore()
+			try {
+				if (list !== null && typeof list.getSnapshot === 'function') snapshot = list.getSnapshot()
+			} catch {
+				snapshot = null
+			}
+			const byId = snapshot !== null && typeof snapshot === 'object' && snapshot.byId !== null && typeof snapshot.byId === 'object' ? snapshot.byId : {}
+			try {
+				const key = serviceOf('uiSession')?.current?.getSnapshot?.()?.key
+				if (typeof key === 'string' && key !== '') return key
+			} catch {
+				/* 取不到就往下走：它不是硬依赖 */
+			}
+			const retained = Object.values(byId).find((row) => row !== null && typeof row === 'object' && (row.retainedBy?.mainView ?? 0) > 0)
+			if (retained !== undefined && typeof retained.id === 'string' && retained.id !== '') return retained.id
+			if (snapshot !== null && typeof snapshot === 'object' && typeof snapshot.current === 'string' && snapshot.current !== '') return snapshot.current
+			const ids = snapshot !== null && typeof snapshot === 'object' && Array.isArray(snapshot.ids) ? snapshot.ids : Object.keys(byId)
+			return ids.length === 1 ? ids[0] : ''
+		}
+
+		/**
+		 * `uiSession.current` 是否**已经给出**当前会话。
+		 *
+		 * 初次挂载时宿主可能还没 publish 主视图绑定；这时 `resolveCurrentSessionId` 的第 ② 级会拿到
+		 * 一个"上次保留的"旧会话（现场：初次进入报「会话 … 现在不活着，读不到名册」）。
+		 * 需要活会话的取数应当**等这一拍**，而不是拿旧 id 去问。
+		 * 没有 `uiSession` 服务的宿主按清单回落（返回 true，保持旧口径）。
+		 * @returns 当前会话是否已可信任。
+		 */
+		function currentSessionAuthoritative() {
+			const service = serviceOf('uiSession')
+			if (service === undefined || service === null) return true
+			try {
+				const key = service.current?.getSnapshot?.()?.key
+				return typeof key === 'string' && key !== ''
+			} catch {
+				return false
+			}
+		}
+
+		/**
+		 * 把「当前会话是否已可信任」做成**会重渲染的值**。
+		 *
+		 * 只读一次 `currentSessionAuthoritative()` 不够：`uiSession.current` 晚到、而落回的会话 id
+		 * 恰好就是正确答案时，`useCurrentSessionId` 的 state 不变 ⇒ 不重渲染 ⇒ 闸永远关着。
+		 * 所以订阅一次，key 一 publish 就把闸打开。
+		 * @returns 是否已可信任当前会话。
+		 */
+		function useSessionAuthority() {
+			const [ready, setReady] = React.useState(() => currentSessionAuthoritative())
+			React.useEffect(() => {
+				const sync = () => setReady(currentSessionAuthoritative())
+				sync()
+				return subscribeCurrentSession(sync)
+			}, [])
+			return ready
+		}
+
+		/**
+		 * 订阅「当前会话」的变化：**清单 store 与 `uiSession.current` 都要订**。
+		 * 只订前者时，切会话不会让这一栏跟着变（当前会话这件事不在清单里）；只订后者时，
+		 * 会话列表自己刷新（例如新会话登记进来）也不会重读。两个都订，任一变化都重读一次。
+		 * @param listener - 变化回调。
+		 * @returns 释放函数（逐个吞掉异常，卸载时不因为一个订阅失败而漏掉其它）。
+		 */
+		function subscribeCurrentSession(listener) {
+			const disposers = []
+			const store = sessionsListStore()
+			if (store !== null && typeof store.subscribe === 'function') {
+				try {
+					const dispose = store.subscribe(listener)
+					if (typeof dispose === 'function') disposers.push(dispose)
+				} catch {
+					/* 订阅失败就退化成"只在挂载时读一次"，不影响其它两栏 */
+				}
+			}
+			try {
+				const source = serviceOf('uiSession')?.current
+				if (source !== null && source !== undefined && typeof source.subscribe === 'function') {
+					const dispose = source.subscribe(listener)
+					if (typeof dispose === 'function') disposers.push(dispose)
+				}
+			} catch {
+				/* 同上：`uiSession` 是可选的 */
+			}
+			return () => {
+				for (const dispose of disposers) {
+					try {
+						dispose()
+					} catch {
+						/* 释放失败不声张 */
+					}
+				}
+			}
+		}
+
+		/**
+		 * 读「当前会话的工作目录」并订阅它的变化。
+		 *
+		 * 视图栏是按会话渲染的：切到别的工作区的会话时，这里必须跟着变，所以订阅"当前会话"这件事
+		 * （见 `subscribeCurrentSession`）而不是取一次。取不到会话服务、或该会话没有 cwd 时返回空串，
+		 * 此时端点回落到 composition 行配的 workspace（宿主还有一级"唯一工作区"回落并在载荷里说明）。
+		 * @param store - 会话清单 store（`ctx.sessions.list`），或 null。
+		 * @returns 当前会话的工作目录；取不到时为空串。
+		 */
+		function useCurrentWorkspace(store) {
+			const read = () => {
+				try {
+					if (store === null || store === undefined || typeof store.getSnapshot !== 'function') return ''
+					const snapshot = store.getSnapshot()
+					const byId = snapshot !== null && typeof snapshot === 'object' && snapshot.byId !== null && typeof snapshot.byId === 'object' ? snapshot.byId : {}
+					const id = resolveCurrentSessionId()
+					// **子智能体的会话行没有 cwd**（它只有 parentId）：沿父链找第一个带 cwd 的行 ——
+					// 团队面板折到根会话之后，工作区也从根会话那一行拿，少让宿主去猜。
+					const cwdOf = (start) => {
+						let row = start === '' ? undefined : byId[start]
+						const seen = new Set()
+						for (let depth = 0; depth < 16; depth += 1) {
+							if (row === null || row === undefined || typeof row !== 'object') return ''
+							if (typeof row.cwd === 'string' && row.cwd !== '') return row.cwd
+							const parent = typeof row.parentId === 'string' ? row.parentId : ''
+							if (parent === '' || seen.has(parent)) return ''
+							seen.add(parent)
+							row = byId[parent]
+						}
+						return ''
+					}
+					return cwdOf(id)
+				} catch {
+					return ''
+				}
+			}
+			const [value, setValue] = React.useState(read)
+			React.useEffect(() => {
+				const sync = () => setValue(read())
+				sync()
+				return subscribeCurrentSession(sync)
+			}, [store])
+			return value
+		}
+
+		/**
+		 * **团队面板按根会话读**：子智能体会话（清单里 `origin: 'subagent'`、带 `parentId`）
+		 * 不是团队会话 —— 它的父链顶端才是领队那个会话，成员 / 任务 / 状态都挂在那儿。
+		 *
+		 * 现场：在 lead 对话里看得到两位成员；切到 fe-dev-1 那个子对话再看，面板按**子会话 id**
+		 * 去取凭据，子会话没在跑 ⇒ 报"会话 … 现在不活着，读不到名册"；技能那一块则退层并告警
+		 * （"清单读的是 root-agent 层"）。所以面板的取数一律沿 `parentId` 走到根；
+		 * 走不到（普通会话 / 清单里没有这一行 / 成环）就用原 id。
+		 * @param store - 会话清单 store（`ctx.sessions.list`），或 null。
+		 * @param sessionId - 当前会话 id。
+		 * @returns 团队会话 id（根）；取不到根时原样返回。
+		 */
+		function teamSessionIdOf(store, sessionId) {
+			if (sessionId === '') return ''
+			let snapshot = null
+			try {
+				snapshot = store !== null && store !== undefined && typeof store.getSnapshot === 'function' ? store.getSnapshot() : null
+			} catch {
+				snapshot = null
+			}
+			const byId = snapshot !== null && typeof snapshot === 'object' && snapshot.byId !== null && typeof snapshot.byId === 'object' ? snapshot.byId : {}
+			let id = sessionId
+			const seen = new Set()
+			// 深度上限与环检测：父链是数据，坏了也不许把面板挂死。
+			for (let depth = 0; depth < 16; depth += 1) {
+				if (seen.has(id)) break
+				seen.add(id)
+				const row = byId[id]
+				const parent = row !== null && typeof row === 'object' && typeof row.parentId === 'string' ? row.parentId : ''
+				if (parent === '' || parent === id) break
+				id = parent
+			}
+			return id
+		}
+
+		/**
+		 * 读「当前是哪个会话」（同一个四级回落，见 `resolveCurrentSessionId`）并订阅它的变化。
+		 *
+		 * **四块都用 `teamSessionIdOf()` 折到根会话**（成员 / 角色 / 技能 / 看板 / 状态）——
+		 * 团队与技能目录都挂在领队那个会话上；子会话没在跑时按子会话读只会退层告警。
+		 * @param store - 会话清单 store（`ctx.sessions.list`），或 null。
+		 * @returns 当前会话 id；取不到时为空串。
+		 */
+		function useCurrentSessionId(store) {
+			const read = () => {
+				try {
+					if (store === null || store === undefined || typeof store.getSnapshot !== 'function') return ''
+					return resolveCurrentSessionId()
+				} catch {
+					return ''
+				}
+			}
+			const [value, setValue] = React.useState(read)
+			React.useEffect(() => {
+				const sync = () => setValue(read())
+				sync()
+				return subscribeCurrentSession(sync)
+			}, [store])
+			return value
+		}
+
+		/**
+		 * 状态页不该出现对话输入框：本视图挂载期间占住输入框那个槽并渲染空。
+		 *
+		 * 该槽是 single 且按 priority 升序取第一个 ⇒ 注册一个 `-1` 的占用者即压过壳自己的注册
+		 * （它用默认 0）。这比"在视图选中/取消时推一个标志"稳妥：槽的注册与释放会通知该槽的
+		 * outlet 自己重渲染，不依赖壳这一轮 render 的先后。卸载即释放 ⇒ 换回对话就恢复。
+		 * @param slots - 客户端 slots 服务。
+		 */
+		function useComposerHidden(slots) {
+			React.useEffect(() => {
+				if (slots === null || slots === undefined || typeof slots.register !== 'function') return () => {}
+				let dispose = null
+				try {
+					dispose = slots.register({ name: 'conversation.composer.bar', id: 'company-ledger-composer-void', priority: -1 }, () => null)
+				} catch {
+					return () => {}
+				}
+				return () => {
+					if (typeof dispose === 'function') dispose()
+				}
+			}, [slots])
+		}
+
+		/**
+		 * 面板首屏：**三行状态 + 三个动作**。
+		 *
+		 * 三条口径（定了就不许含糊）：
+		 *   · 那几行**不由前端算** —— 端点 `/company-board/api/status` 把看板文件交给引擎的
+		 *     `statusSnapshot`，也就是会话工具 `team_status` 用的同一份实现 ⇒ 面板与工具不会各说各话；
+		 *   · **明细就地展开**：现有三栏 + 成员栏的内容一个都不删，只是不再默认占屏（「不做多页」指的是默认别铺开）；
+		 *   · 缺文件时照端点给的如实陈述走（那个数写 `?`），前端**不替它补 0**。
+		 */
+		/**
+		 * **该占的高度 = 自己这块的顶边到容器底边**（不是"猜壳占了多少像素"）。
+		 *
+		 * 壳给视图的高度是 auto（百分比高度算不出确定值），所以只能用视口高减一个猜的常数 ——
+		 * 那个常数**壳一改就错**：留多了底下就是一大块空白（现场就是这么来的），留少了主页面被顶长。
+		 * 这里改成**量**：顶边到容器底边的距离；量不到时返回 null，外层退回 CSS 里的兜底高度。
+		 *
+		 * @param top - 自己这块的顶边（视口坐标）
+		 * @param parentBottom - 容器的底边（视口坐标）
+		 * @param viewport - 视口高度（上界，防容器底边报出一个超出屏幕的值）
+		 * @returns 像素数；算出比 320 还小（或读数是 NaN）时取 320，免得被压成一条。
+		 */
+		function fillHeightFrom(top, parentBottom, viewport) {
+			const ceiling = Math.min(parentBottom, viewport)
+			const next = Math.round(ceiling - top)
+			return Number.isFinite(next) && next >= 320 ? next : 320
+		}
+
+		/**
+		 * 可用高度：**优先按壳自己的滚动容器量**（`[data-conversation-scroll]`，那条收拖拽条的 CSS 用的同一个）。
+		 *
+		 * 为什么不用父元素：父元素是"跟着我们长"的自动高度盒子 —— 拿它当基准，可用高度会被锁死在
+		 * **我们当前这一坨的高度**上，于是面板永远是"内容多高就多高"，底下那一块空白永远补不上。
+		 * 壳的滚动容器尺寸由壳决定，不随我们内容变，这才是一个不会自己锁死自己的基准。
+		 *
+		 * @param container - 壳滚动容器的盒子（`{ top, height }`），量不到时传 null
+		 * @param top - 本栏的顶边（视口坐标）
+		 * @param parentBottom - 兜底基准：父元素底边
+		 * @param viewport - 兜底基准：视口高度
+		 */
+		function paneHeightFrom(container, top, parentBottom, viewport) {
+			if (container !== null && container !== undefined && Number.isFinite(container.top) && Number.isFinite(container.height)) {
+				// 容器内、本栏顶边以下还剩多少：滚动位置不影响它（用相对偏移算），并夹在容器高度之内。
+				const room = container.height - (top - container.top)
+				return Math.round(Math.min(Math.max(room, 320), container.height))
+			}
+			return fillHeightFrom(top, parentBottom, viewport)
+		}
+
+		/** 从 DOM 量出该占的高度；读不到（无 DOM / 没本栏标记 / 拿不到盒子）返回 null。 */
+		/**
+		 * 输入区（composer）占掉的高度 —— 从**壳自己发布的 CSS 变量**读：`--dsh-composer-height`。
+		 * 壳内部就靠它给"回到底部"按钮让位（`bottom: calc(var(--dsh-composer-height,152px) + 16px)`），
+		 * 也就是说：**滚动容器的可视区一直延伸到输入区底下**，这块空间不扣掉，面板就会高出可用区（主体滑动）。
+		 * 读不到就返回 0（宁可不扣，也不瞎扣）。
+		 */
+		function shellComposerHeight(scroller) {
+			if (typeof window === 'undefined' || typeof window.getComputedStyle !== 'function') return 0
+			if (scroller === null || scroller === undefined) return 0
+			try {
+				// 必须在滚动容器自己身上读 `--dsh-composer-height`（CSS 变量只往下继承，`documentElement` 读不到）；
+				// 从祖先读会得到 0，正好少扣一个输入区高度，面板高出可用区、主体滑动。
+				const style = window.getComputedStyle(scroller)
+				const value = Number.parseFloat(style === null || style === undefined || typeof style.getPropertyValue !== 'function' ? '' : style.getPropertyValue('--dsh-composer-height'))
+				return Number.isFinite(value) && value > 0 ? Math.round(value) : 0
+			} catch (error) {
+				return 0
+			}
+		}
+
+		function measuredPaneHeight() {
+			if (typeof document === 'undefined' || typeof document.querySelector !== 'function' || typeof window === 'undefined') return null
+			let node = null
+			try {
+				node = document.querySelector('[data-team-ops-pane]')
+			} catch (error) {
+				return null
+			}
+			if (node === null || node === undefined || typeof node.getBoundingClientRect !== 'function') return null
+			const box = node.getBoundingClientRect()
+			if (box === null || box === undefined) return null
+			const parent = node.parentElement
+			const parentBottom =
+				parent === null || parent === undefined || typeof parent.getBoundingClientRect !== 'function'
+					? window.innerHeight
+					: parent.getBoundingClientRect().bottom
+			let container = null
+			let scrollerNode = null
+			try {
+				const scroller = document.querySelector('[data-conversation-scroll]')
+				scrollerNode = scroller
+				if (scroller !== null && scroller !== undefined && typeof scroller.getBoundingClientRect === 'function') {
+					const scrollBox = scroller.getBoundingClientRect()
+					// **用滚动容器的内高（clientHeight），不用它的外框高**：外框高在某些主题/缩放含 padding 或边框，
+					// 而 `clientHeight` 就是"能看见的那块高度"（也不含横向滚动条）。面板占的正是这块。
+					const inner = typeof scroller.clientHeight === 'number' && scroller.clientHeight > 0 ? scroller.clientHeight : null
+					if (scrollBox !== null && scrollBox !== undefined) {
+						container = { top: scrollBox.top, height: inner === null ? scrollBox.height : inner }
+					}
+				}
+			} catch (error) {
+				container = null
+			}
+			// 两条定死的规矩：① 主体不许滑（留余量、以视口为上界）；② 列要铺满面板高度（基准必须由壳决定）。
+			// 绝不把父元素底边算进来：父元素跟着内容长高，算进来量到的就是"当前内容多高"，面板会贴着内容缩。
+			const byViewport = fillHeightFrom(box.top, window.innerHeight, window.innerHeight)
+			const byShell = container !== null && container !== undefined
+				? paneHeightFrom(container, box.top, parentBottom, window.innerHeight)
+				: fillHeightFrom(box.top, parentBottom, window.innerHeight)
+			// 不按"容器溢出多少"回退（那个读数混着别人撑出的溢出，照减会把面板缩矮）；
+			// 口径：面板高度 = 容器内本栏以下可视高 − 余量（视口为上界）。输入区是滚动容器的子元素、`clientHeight` 包含它 ⇒ 无条件扣，用壳实测值。
+			const composer = shellComposerHeight(scrollerNode)
+			const candidate = Math.min(byShell, byViewport) - PANE_HEIGHT_MARGIN - composer
+			return Math.max(160, Math.round(candidate))
+		}
+
+		/**
+		 * 量到的面板高度（null = 量不到 ⇒ 走 CSS 里的兜底高度）。
+		 * 挂载后量一次并逐帧补量几轮（容器可能比本栏晚定尺寸），之后跟窗口 resize。
+		 */
+		function usePaneHeight() {
+			const [height, setHeight] = React.useState(null)
+			React.useEffect(() => {
+				let frame = 0
+				let tries = 0
+				const measure = () => {
+					const next = measuredPaneHeight()
+					setHeight((previous) => (previous === next ? previous : next))
+				}
+				measure()
+				if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+					const tick = () => {
+						frame = 0
+						tries += 1
+						measure()
+						if (tries < 20) frame = window.requestAnimationFrame(tick)
+					}
+					frame = window.requestAnimationFrame(tick)
+				}
+				if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('resize', measure)
+				// 别人改变输入区高度后要重量：壳用 ResizeObserver 把结果写进 `--dsh-composer-height`（写在滚动容器 style 上），
+				// 所以这里盯两样：容器尺寸变化 + 容器 style 属性变化（只量"挂载后 20 帧 + resize"不够）。
+				let resizeObserver = null
+				let mutationObserver = null
+				try {
+					const scrollerNode = typeof document === 'undefined' || typeof document.querySelector !== 'function' ? null : document.querySelector('[data-conversation-scroll]')
+					if (scrollerNode !== null && scrollerNode !== undefined) {
+						if (typeof window.ResizeObserver === 'function') {
+							resizeObserver = new window.ResizeObserver(measure)
+							resizeObserver.observe(scrollerNode)
+						}
+						if (typeof window.MutationObserver === 'function') {
+							mutationObserver = new window.MutationObserver(measure)
+							mutationObserver.observe(scrollerNode, { attributes: true, attributeFilter: ['style'] })
+						}
+					}
+				} catch (error) {
+					// 观测不上也不许把面板搞崩：量高退回"挂载后量一次 + 窗口 resize"。
+					resizeObserver = null
+					mutationObserver = null
+				}
+				return () => {
+					if (frame !== 0 && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(frame)
+					if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') window.removeEventListener('resize', measure)
+					if (resizeObserver !== null && typeof resizeObserver.disconnect === 'function') resizeObserver.disconnect()
+					if (mutationObserver !== null && typeof mutationObserver.disconnect === 'function') mutationObserver.disconnect()
+				}
+			}, [])
+			return height
+		}
+
+		/**
+		 * 成员卡的**编制三态词**：`member.status` 与这三个词逐字相等才认（设计 §2.1）。
+		 * 枚举外的值**照显原文、不归并** —— 归并会把"文件里出现了一个没人认识的状态"这件事抹掉。
+		 */
