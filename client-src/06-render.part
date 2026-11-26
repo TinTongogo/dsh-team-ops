@@ -1,0 +1,369 @@
+		// ── ⑥ 渲染原语与 Markdown ──────────────────────────────────────────
+		const el = (type, props, ...children) => React.createElement(type, props, ...children)
+
+		/**
+		 * 把一个**定高定位的浮层** portal 到 `document.body`：`position: fixed` 从此真的以视口为准。
+		 *
+		 * 为什么要有它：宿主的输入框一带（`.composerSeat`，已激活会话下带 `will-change: transform`）
+		 * 会给后代造一个包含块，挂在里面的 `fixed` 浮层会**跟着那一层走**而不是跟着视口走 —— 表现就是
+		 * 选择框跟按钮对不上（宿主插槽契约对此的原话见 `react-dom` 种子上面那段注释）。
+		 * 本插件只有这一处浮层长在输入框里，所以只有这一处要 portal。视图栏那几块里的浮窗/弹窗**不在这条
+		 * 契约的点名范围里**（宿主只对 `conversation.input.left` 提了这条要求）⇒ 别顺手改它们：改了就要
+		 * 重新验它们的层级、关闭与键盘路径，而现场并没有报那几处错位。
+		 *
+		 * 三级退化，一级比一级保守（**任何一级都不许抛**）：
+		 *   ① 有 `react-dom` 的 `createPortal` ⇒ portal 到 `document.body`（正路）；
+		 *   ② 没有这个种子 / 没有 `createPortal`（离线自检那套"穷人的 React"）⇒ 原样返回，就地渲染；
+		 *   ③ `createPortal` 自己抛（老版本签名）⇒ 同样原样返回。
+		 * @param node - 浮层元素（`null` / `undefined` 原样返回，调用方不用先判）。
+		 * @returns 包好的 portal，或原样的节点。
+		 */
+		const portalOf = (node) => {
+			if (node === null || node === undefined) return node
+			if (ReactDOM === null || typeof ReactDOM.createPortal !== 'function') return node
+			if (typeof document === 'undefined' || document.body === null || document.body === undefined) return node
+			try {
+				return ReactDOM.createPortal(node, document.body)
+			} catch {
+				return node
+			}
+		}
+
+		const text = (value) => (value === null || value === undefined ? '' : '' + value)
+
+		const unquote = (value) => {
+			if (typeof value !== 'string') return ''
+			const trimmed = value.trim()
+			if (trimmed.length > 1 && trimmed.charAt(0) === '`' && trimmed.charAt(trimmed.length - 1) === '`') {
+				return trimmed.slice(1, trimmed.length - 1)
+			}
+			return trimmed
+		}
+
+		const shortTime = (value) => {
+			if (typeof value !== 'string' || value.length === 0) return '—'
+			return value.replace('T', ' ').slice(0, 16)
+		}
+
+		// ── Markdown 渲染 ────────────────────────────────────────────────────
+		// 文件文本按 GFM 子集渲染（标题 / 围栏代码 / 引用 / 列表 / 分隔线 / 段落 + 行内代码、粗斜体、删除线、链接）。
+		// 两条硬约束：① 只构造 React 元素，不用 dangerouslySetInnerHTML（尖括号原样显示，注入不了标记）；
+		// ② 链接只认 http/https/mailto 与页内锚点，其余（javascript:、data: 等）按纯文本显示。
+
+		/** 可以安全放进 href 的协议前缀。 */
+		const SAFE_HREF = /^(https?:\/\/|mailto:|#|\/)/i
+		/** 行内标记的扫描式：每一项都从当前位置找最早出现的那一个。 */
+		const MD_SPAN = [
+			{ re: /`([^`\n]+)`/, make: (m, key) => el('code', { key }, m[1]) },
+			{ re: /\*\*(?!\s)([\s\S]+?)(?<!\s)\*\*/, make: (m, key) => el('strong', { key }, m[1]) },
+			{ re: /__(?!\s)([\s\S]+?)(?<!\s)__/, make: (m, key) => el('strong', { key }, m[1]) },
+			{ re: /~~(?!\s)([\s\S]+?)(?<!\s)~~/, make: (m, key) => el('del', { key }, m[1]) },
+			{ re: /\*(?!\s)([^*\n]+?)(?<!\s)\*/, make: (m, key) => el('em', { key }, m[1]) },
+			// 词内下划线不算强调（GFM 同款）：两侧都要是非单词字符或边界。
+			{ re: /(?<![\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w])/, make: (m, key) => el('em', { key }, m[1]) },
+			{
+				re: /\[([^\]\n]+)\]\(([^)\s]+)\)/,
+				make: (m, key) => (SAFE_HREF.test(m[2]) ? el('a', { key, href: m[2], target: '_blank', rel: 'noreferrer noopener' }, m[1]) : m[0]),
+			},
+			{
+				re: /(https?:\/\/[^\s<>()]+)/,
+				make: (m, key) => el('a', { key, href: m[1], target: '_blank', rel: 'noreferrer noopener' }, m[1]),
+			},
+		]
+
+		/**
+		 * 把一段文本切成 React 节点数组：普通文字原样（由 React 转义），标记段落成元素。
+		 * @param source - 待渲染文本。
+		 * @param prefix - 生成 key 的前缀，保证同一段里各节点 key 唯一。
+		 * @returns 节点数组。
+		 */
+		const inlineNodes = (source, prefix) => {
+			const out = []
+			let rest = '' + source
+			let n = 0
+			while (rest.length > 0) {
+				let best = null
+				for (const span of MD_SPAN) {
+					const match = span.re.exec(rest)
+					if (match === null) continue
+					if (best === null || match.index < best.match.index) best = { span, match }
+				}
+				if (best === null) {
+					out.push(rest)
+					break
+				}
+				if (best.match.index > 0) out.push(rest.slice(0, best.match.index))
+				out.push(best.span.make(best.match, prefix + '-i' + n++))
+				rest = rest.slice(best.match.index + best.match[0].length)
+			}
+			return out
+		}
+
+		/** 一个段落里的换行：行尾两个空格或反斜杠是硬换行，其余按空格连接。 */
+		const paragraphNodes = (source, prefix) => {
+			const out = []
+			const lines = ('' + source).split('\n')
+			for (let i = 0; i < lines.length; i++) {
+				const line = lines[i]
+				const hard = /( {2,|\\)$/.test(line)
+				const body = hard ? line.replace(/( {2,}|\\)$/, '') : line
+				out.push(...inlineNodes(body, prefix + '-l' + i))
+				if (i < lines.length - 1) out.push(hard ? el('br', { key: prefix + '-br' + i }) : ' ')
+			}
+			return out
+		}
+
+		/**
+		 * 把一段文本切成块：围栏代码块、标题、引用、列表、分隔线、段落。
+		 * @param source - 待渲染文本。
+		 * @returns 块数组。
+		 */
+		/** 一行像不像表格行：至少有一个 `|`，且去掉首尾竖线后至少有一格非空。 */
+		const isTableRow = (line) => typeof line === 'string' && line.includes('|') && line.trim() !== ''
+
+		/** 分隔行：`|---|:--:|` 这种（每格至少两个短横，允许首尾对齐冒号）。 */
+		const isTableDivider = (line) => {
+			if (typeof line !== 'string') return false
+			const trimmed = line.trim()
+			if (!trimmed.includes('-')) return false
+			if (!/^\|?[\s:-]*(\|[\s:-]*)*\|?$/.test(trimmed)) return false
+			return trimmed
+				.replace(/^\|/, '')
+				.replace(/\|$/, '')
+				.split('|')
+				.every((cell) => /^\s*:?-{2,}:?\s*$/.test(cell))
+		}
+
+		/** 拆一行表格：去掉首尾竖线，按 `|` 切（`\|` 不当分隔），每格 trim。 */
+		const splitRow = (line) => {
+			const body = ('' + line).trim().replace(/^\|/, '').replace(/\|$/, '')
+			const cells = []
+			let cell = ''
+			for (let at = 0; at < body.length; at += 1) {
+				const ch = body.charAt(at)
+				if (ch === '\\' && body.charAt(at + 1) === '|') {
+					cell += '|'
+					at += 1
+					continue
+				}
+				if (ch === '|') {
+					cells.push(cell.trim())
+					cell = ''
+					continue
+				}
+				cell += ch
+			}
+			cells.push(cell.trim())
+			return cells
+		}
+
+		const mdBlocks = (source) => {
+			const lines = ('' + source).replace(/\r\n?/g, '\n').split('\n')
+			const blocks = []
+			const FENCE = /^\s*(`{3,}|~{3,})\s*([A-Za-z0-9+#-]*)\s*$/
+			const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/
+			const QUOTE = /^\s{0,3}>\s?/
+			const BULLET = /^\s*[-*+]\s+(.*)$/
+			const NUMBERED = /^\s*\d{1,9}[.)]\s+(.*)$/
+			const HR = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/
+			const startsBlock = (line) => FENCE.test(line) || HEADING.test(line) || QUOTE.test(line) || BULLET.test(line) || NUMBERED.test(line) || HR.test(line)
+			let i = 0
+			while (i < lines.length) {
+				const line = lines[i]
+				if (/^\s*$/.test(line)) {
+					i += 1
+					continue
+				}
+				const fence = FENCE.exec(line)
+				if (fence !== null) {
+					const bar = fence[1].charAt(0)
+					const close = new RegExp('^\\s*' + (bar === '`' ? '`' : '~') + '{' + fence[1].length + ',}\\s*$')
+					const body = []
+					i += 1
+					while (i < lines.length && !close.test(lines[i])) {
+						body.push(lines[i])
+						i += 1
+					}
+					if (i < lines.length) i += 1
+					blocks.push({ type: 'code', lang: fence[2], text: body.join('\n') })
+					continue
+				}
+				const heading = HEADING.exec(line)
+				if (heading !== null) {
+					blocks.push({ type: 'heading', level: heading[1].length, text: heading[2] })
+					i += 1
+					continue
+				}
+				if (HR.test(line) && !BULLET.test(line)) {
+					blocks.push({ type: 'hr' })
+					i += 1
+					continue
+				}
+				if (QUOTE.test(line)) {
+					const body = []
+					while (i < lines.length && QUOTE.test(lines[i])) {
+						body.push(lines[i].replace(QUOTE, ''))
+						i += 1
+					}
+					blocks.push({ type: 'quote', text: body.join('\n') })
+					continue
+				}
+				// GFM 管道表格：`| a | b |` + 一行分隔 + 若干数据行；只有一行带 `|` 或第二行不是分隔行就照旧当段落，
+				// 单元格内的行内语法照旧走 `inlineNodes`。
+				if (isTableRow(line) && isTableDivider(lines[i + 1])) {
+					const header = splitRow(line)
+					const align = splitRow(lines[i + 1]).map((cell) => {
+						const left = cell.startsWith(':')
+						const right = cell.endsWith(':')
+						return left && right ? 'center' : right ? 'right' : left ? 'left' : ''
+					})
+					i += 2
+					const rows = []
+					while (i < lines.length && isTableRow(lines[i]) && !/^\s*$/.test(lines[i])) {
+						rows.push(splitRow(lines[i]))
+						i += 1
+					}
+					blocks.push({ type: 'table', header, align, rows })
+					continue
+				}
+				if (BULLET.test(line) || NUMBERED.test(line)) {
+					const ordered = NUMBERED.test(line)
+					const items = []
+					while (i < lines.length) {
+						const match = ordered ? NUMBERED.exec(lines[i]) : BULLET.exec(lines[i])
+						if (match === null) break
+						items.push(match[1])
+						i += 1
+					}
+					blocks.push({ type: 'list', ordered, items })
+					continue
+				}
+				const body = []
+				while (
+					i < lines.length &&
+					!/^\s*$/.test(lines[i]) &&
+					!startsBlock(lines[i]) &&
+					!(isTableRow(lines[i]) && isTableDivider(lines[i + 1]))
+				) {
+					body.push(lines[i])
+					i += 1
+				}
+				if (body.length === 0) {
+					// 起止条件互相咬住时兜底前进一行，避免死循环。
+					body.push(lines[i])
+					i += 1
+				}
+				blocks.push({ type: 'para', text: body.join('\n') })
+			}
+			return blocks
+		}
+
+		/** 把一个块渲染成元素。 */
+		const mdBlockNode = (block, key) => {
+			if (block.type === 'code') {
+				return el('pre', { className: 'cbv-md-pre', key }, el('code', {}, block.text))
+			}
+			if (block.type === 'heading') {
+				const level = Math.min(6, Math.max(1, block.level))
+				return el('h' + level, { className: 'cbv-md-h', key }, inlineNodes(block.text, key + 'h'))
+			}
+			if (block.type === 'hr') return el('hr', { className: 'cbv-md-hr', key })
+			if (block.type === 'table') {
+				// 宽表格要能横着看：外面套一层可滚容器（窄表格看不出差别，宽表格不至于撑破浮窗）。
+				const cell = (value, index, tag) =>
+					el(
+						tag,
+						{ className: 'cbv-md-cell' + (block.align[index] === '' ? '' : ' cbv-md-cell--' + block.align[index]), key: key + tag + index },
+						inlineNodes(value, key + tag + index),
+					)
+				return el(
+					'div',
+					{ className: 'cbv-md-table-wrap', key },
+					el(
+						'table',
+						{ className: 'cbv-md-table' },
+						el('thead', {}, el('tr', {}, block.header.map((value, index) => cell(value, index, 'th')))),
+						el('tbody', {}, block.rows.map((row, r) => el('tr', { key: key + 'r' + r }, block.header.map((_, c) => cell(row[c] === undefined ? '' : row[c], c, 'td'))))),
+					),
+				)
+			}
+			if (block.type === 'quote') return el('blockquote', { className: 'cbv-md-quote', key }, paragraphNodes(block.text, key + 'q'))
+			if (block.type === 'list') {
+				return el(
+					block.ordered ? 'ol' : 'ul',
+					{ className: 'cbv-md-list', key },
+					block.items.map((item, index) => el('li', { key: key + 'li' + index }, paragraphNodes(item, key + 'li' + index))),
+				)
+			}
+			return el('p', { className: 'cbv-md-p', key }, paragraphNodes(block.text, key + 'p'))
+		}
+
+		/**
+		 * 一段文件文本 → 渲染好的块元素数组。
+		 * @param source - 待渲染文本。
+		 * @param prefix - key 前缀。
+		 * @returns 元素数组。
+		 */
+		const markdownNodes = (source, prefix) => mdBlocks(source).map((block, index) => mdBlockNode(block, prefix + '-b' + index))
+
+		/**
+		 * 文件文本字段的统一出口：空值给占位文案，非空按 Markdown 渲染。
+		 * @param className - 外层类名（会自动追加 cbv-md 标记）。
+		 * @param value - 字段值。
+		 * @param placeholder - 空值时的占位文案（可为空串，表示不给占位）。
+		 * @param key - React key。
+		 * @returns 元素。
+		 */
+		const mdField = (className, value, placeholder, key) => {
+			const source = text(value)
+			if (source.trim() === '') return el('div', { className, key }, placeholder)
+			return el('div', { className: className + ' cbv-md', key }, markdownNodes(source, key))
+		}
+
+		/** 条目的全部标量叶子拼成一个可搜字符串（嵌套对象与数组一并纳入）。 */
+		const haystackOf = (item) => {
+			const parts = []
+			const keys = Object.keys(item)
+			for (let i = 0; i < keys.length; i++) {
+				const value = item[keys[i]]
+				if (typeof value === 'string') parts.push(value)
+				else if (typeof value === 'number' || typeof value === 'boolean') parts.push('' + value)
+				else if (Array.isArray(value)) {
+					for (let j = 0; j < value.length; j++) {
+						const nested = value[j]
+						if (typeof nested === 'string') parts.push(nested)
+						else if (nested !== null && typeof nested === 'object') parts.push(haystackOf(nested))
+					}
+				}
+			}
+			return parts.join(' ').toLowerCase()
+		}
+
+		/** 某字段出现的全部取值，升序。 */
+		const facetValuesOf = (items, field) => {
+			const seen = {}
+			const out = []
+			for (let i = 0; i < items.length; i++) {
+				const value = items[i][field]
+				if (value === null || value === undefined) continue
+				const key = '' + value
+				if (seen[key] === true) continue
+				seen[key] = true
+				out.push(key)
+			}
+			out.sort()
+			return out
+		}
+
+		/** 按状态分栏：先按 spec.statusOrder，再把枚举外的取值单列在后。 */
+		/**
+		 * 头像图标的几何：**一条 24×24 的描边 SVG**（人的指令：emoji 头像改成不带色彩的图标）。
+		 *
+		 * 几件要说清的事：
+		 *   · 引擎只给**图标名**（`ROLE_AVATAR_ICONS`），几何在这一处 —— 表现层的事不塞进引擎；
+		 *   · **不上色**：整条 SVG 只用 `currentColor` 描边，深浅由卡上那五档中性透明度给，
+		 *     于是面板里那 20 来个头像不再是"一片彩色 emoji"；
+		 *   · 命名与网格按 Lucide / Feather 那套 24×24 描边图标来（**几何是照规范自己画的**，
+		 *     不是它们的原版路径 —— 本机取不到原版，所以不主张原样搬运）；
+		 *   · 认不出名字时不画空白：回落到**首字母**（`avatarOf` 之外的手写角色名也能看）。
+		 */

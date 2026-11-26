@@ -1,0 +1,1860 @@
+		// ── ⑫ 成员块 ─────────────────────────────────────────────────────
+		// ── 成员上下文：卡上「上下文占用」+ 面板内整页详情（design-member-context-003 / 004）──
+		// 卡上常驻行是**入口**（点它或整卡打开详情页）；页面是 `MembersView` 的状态分支，
+		// **不是新块**（003 §⑧：不新增 tab、不新增面板席位）。
+		/** 详情页每段一页的条数（`tokens.md:168` 的 `--cbv-list-page` 参数，不是 CSS 变量）。 */
+		const CTX_PAGE_SIZE = 50
+		/**
+		 * 七段的**固定顺序**与色块（003 §4.4 / 004 §5.5）。
+		 *
+		 * 只有三枚 chart 色（系统 / 工具 / 消息）：其余五段都属于宿主的 `messageTokens` 那一桶，
+		 * 一律借 messages 色 —— 段的身份由**名称**承担，色只承担"属于哪一桶"。
+		 */
+		const CTX_SEGMENTS = [
+			{ key: 'system', label: '系统提示词', swatch: 'var(--dsw-alias-chart-system)' },
+			{ key: 'tools', label: '工具定义', swatch: 'var(--dsw-alias-chart-tools)' },
+			{ key: 'user', label: '用户消息', swatch: 'var(--dsw-alias-chart-messages)' },
+			{ key: 'inject', label: '注入内容', swatch: 'var(--dsw-alias-chart-messages)' },
+			{ key: 'skill', label: '技能注入', swatch: 'var(--dsw-alias-chart-messages)' },
+			{ key: 'assistant', label: '助手消息', swatch: 'var(--dsw-alias-chart-messages)' },
+			{ key: 'tool', label: '工具结果', swatch: 'var(--dsw-alias-chart-messages)' },
+		]
+		/** 详情页的文案（P 系列逐字取自 003 §⑨；C 系列卡面文案的正文在 001 §7.4）。 */
+		const CTX_TEXT = {
+			footEstimate: '构成是估算（约每 4 字符 1 token）；七类与三段同源，与顶部占用（提供方实测）不同源。',
+			footFrame: '逐工具之和与「工具定义」合计的差是 JSON 结构框（约 +15 token）。',
+			l1: (reason) => '细类读不到（' + reason + '）：下面只给三段构成。',
+			l2: '这个部署没有上下文计量服务（token-meter）：占用与构成都读不到。',
+			l3: '它现在没有活着的会话：没有上下文可拆。',
+			noRequest: '还没跑过请求：已用与容量未知',
+			emptySegment: '这一档读不到。',
+			// P23：数据面没给 preview 时的兜底（不画 P15/P20）。
+			noPreview: '这一份系统提示没有正文预览：只读得到整段的估算值。',
+			more: (shown, total) => '显示更多（' + shown + '/' + total + '）',
+			absentTitle: '它现在没有活着的会话：没有上下文窗口可读。',
+			// P28：已结束成员用**持久投影缓存**读到的末次读数（缓存只有 seq、没有墙钟，003 v2.5 §1.16）。
+			endedCacheTitle: (asOfSeq) => '它已经结束：显示上一次落盘的读数（截至 seq ' + asOfSeq + '），不会再变。',
+		}
+		/**
+		 * token 数 → 宿主那一套缩写（十进制、末尾 0 不补）：`~442k` / `1M`。
+		 * 卡上摘要用 `~`（002 §四.2），七段与逐项用 `≈`（003 §1.9）—— 两处含义不同，别合并。
+		 */
+		const ctxTokenTextOf = (value) => {
+			if (typeof value !== 'number' || !Number.isFinite(value)) return ''
+			const scaled = (candidate) => (candidate >= 100 ? String(Math.round(candidate)) : String(Math.round(candidate * 10) / 10))
+			if (value < 1000) return '~' + String(Math.round(value))
+			if (value < 1000000) return '~' + scaled(value / 1000) + 'k'
+			return '~' + scaled(value / 1000000) + 'M'
+		}
+		/** 容量这类**已知数**的缩写（不带 `~`）：`1M`（末尾 0 不补，与宿主 `formatTokens` 同款）。 */
+		const ctxCountTextOf = (value) => {
+			const text = ctxTokenTextOf(value)
+			return text === '' ? '' : text.slice(1)
+		}
+		/** 七段/逐项的估算值：`≈` 前缀（D1 的记号分工）。 */
+		const ctxApproxOf = (value) => {
+			const text = ctxTokenTextOf(value)
+			return text === '' ? '' : '≈' + text.slice(1)
+		}
+		/** 占用百分比：`min(100, round(used ÷ window × 100))`（与宿主 `context-occupancy.ts` 同一条）。 */
+		const ctxPercentOf = (used, contextWindow) => {
+			if (typeof used !== 'number' || !Number.isFinite(used) || used < 0) return null
+			if (typeof contextWindow !== 'number' || !Number.isFinite(contextWindow) || contextWindow <= 0) return null
+			return Math.min(100, Math.round((used / contextWindow) * 100))
+		}
+		/** 占用一段的占比（四舍五入到整数百分比；用于 toc / 段行右侧那一格）。 */
+		const ctxShareOf = (tokens, total) => (typeof tokens !== 'number' || typeof total !== 'number' || total <= 0 ? '' : Math.round((tokens / total) * 100) + '%')
+		/** 三段条的三段宽度（`percent × seg ÷ 三段之和`，两位小数）；为 0 的段不画。 */
+		const ctxBarSegsOf = (percent, segments) => {
+			if (segments === null || segments === undefined || typeof percent !== 'number' || !Number.isFinite(percent)) return []
+			const system = typeof segments.system === 'number' ? segments.system : 0
+			const tools = typeof segments.tools === 'number' ? segments.tools : 0
+			const messages = typeof segments.messages === 'number' ? segments.messages : 0
+			const total = system + tools + messages
+			if (total <= 0) return []
+			return [
+				{ key: 'system', tokens: system, width: (percent * system) / total, color: 'var(--dsw-alias-chart-system)' },
+				{ key: 'tools', tokens: tools, width: (percent * tools) / total, color: 'var(--dsw-alias-chart-tools)' },
+				{ key: 'messages', tokens: messages, width: (percent * messages) / total, color: 'var(--dsw-alias-chart-messages)' },
+			].filter((seg) => seg.tokens > 0 && seg.width > 0)
+		}
+		/** ② 不在场那三种词：只换括号里的词，不新增状态（`RUNTIME_WORD` 的客户端同款）。 */
+		const ctxAbsentWordOf = (runtime) => (runtime === 'provisioning' ? '创建中' : runtime === 'failed' ? '失败' : '不在场')
+		/** ISO 时刻 → `HH:MM:SS`（数据时刻；本地时区）。 */
+		const ctxClockOf = (value) => {
+			const date = typeof value === 'string' ? new Date(value) : null
+			if (date === null || Number.isNaN(date.getTime())) return '—'
+			const pad = (part) => (part < 10 ? '0' + part : '' + part)
+			return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+		}
+		/** 一个成员行上的占用读数（没有这一格 = 老载荷 / 服务缺席 ⇒ 卡上不画那一行）。 */
+		const ctxOccupancyOf = (row) => {
+			const value = row === null || row === undefined ? undefined : row.contextOccupancy
+			return value !== null && value !== undefined && typeof value === 'object' ? value : null
+		}
+		/** 已用 token：`projectedTokens` 优先、`pressureTokens` 次之（与宿主同一条）。 */
+		const ctxUsedOf = (occupancy) => {
+			if (occupancy === null || occupancy === undefined) return null
+			if (typeof occupancy.projectedTokens === 'number') return occupancy.projectedTokens
+			if (typeof occupancy.pressureTokens === 'number') return occupancy.pressureTokens
+			return null
+		}
+		/** 工具段的三档排序（与宿主 `sortedToolsOf` 同一条规则；浏览器侧拿不到 lib，故就地一份）。 */
+		const ctxSortedToolsOf = (tools, sort) => {
+			const list = Array.isArray(tools) ? tools.slice() : []
+			const byName = (a, b) => text(a?.name).localeCompare(text(b?.name))
+			if (sort === 'name') return list.sort(byName)
+			const key = sort === 'count' ? 'calls' : 'tokens'
+			return list.sort((a, b) => {
+				const left = typeof a?.[key] === 'number' ? a[key] : 0
+				const right = typeof b?.[key] === 'number' ? b[key] : 0
+				return right - left || byName(a, b)
+			})
+		}
+		/** 只在有真 DOM 时才做动画：离线自检那套"穷人的 React"没有 ref / rAF，跳过即可（不是错误）。 */
+		/** `useLayoutEffect` 在离线自检那套"穷人的 React"里没有 ⇒ 退回 `useEffect`（那里没有 DOM，动画本来就跳过）。 */
+		const useIsoLayoutEffect = typeof React.useLayoutEffect === 'function' ? React.useLayoutEffect : React.useEffect
+		const ctxRafTwice = (run) => {
+			try {
+				if (typeof requestAnimationFrame === 'function') {
+					requestAnimationFrame(() => requestAnimationFrame(run))
+					return
+				}
+			} catch {}
+			try {
+				setTimeout(run, 16)
+			} catch {}
+		}
+		/**
+		 * 「成员」块（视图栏第一块，打开面板即落在这里）：**本会话现在有哪些 agent**。
+		 *
+		 * 数据**只有一个来源**：本会话的 Agent 团队名册（宿主 `ctx.agentTeams`，与内置 `list_agents`
+		 * 同一处正文）—— 协调者永远在最前，其后是队友（`running` / `inactive` / `provisioning` / `failed`）。
+		 * **本插件起没起过成员都不影响它** ⇒ 这块不会"一个 agent 都不展示"。
+		 * 旧名册文件（`.ops/members.json`）已撤（task-40）：面板不读它，也没有"在册 / 未入册"了。
+		 * 卡上只读的几格各自的真源：运行时状态（活着的 Agent）、**已停用**（`.ops/member-flags.json`）、
+		 * 未读（邮箱文件）、头像与色调（引擎按角色给）。
+		 *
+		 * **这一块只读**：成员是**宿主原生的队友**，本插件不改、不删、不启停；卡上只有服务端给的那三个动词
+		 * （停用 / 恢复 / 打断，`row.verbs`），停用与打断的口径挂在各自按钮的 title 上（服务端 `why` 原文）。
+		 * **角色目录不在这里** —— 它是「角色」块（⑬ `RolesView`）；生成员也不在这里（那是 `member_spawn`）。
+		 * @param props - `sessions` 取当前会话（工作区与团队名册都按它拿）；
+		 *   `reload` 是面板的重读计数（切块 / 窗口回到前台 / 面板重新可见时 +1）；读失败时本块给一枚「重读」。
+		 */
+		function MembersView(props) {
+			const active = props.active !== false
+			const store = props.sessions === undefined ? null : typeof props.sessions === 'function' ? props.sessions() : props.sessions
+			const workspace = useCurrentWorkspace(store)
+			// 会话 id 必须带上：团队名册是按**这个会话**拿的（`?session=`），少了它宿主只能报"读不到"。
+			// 子智能体对话里点开面板时，折到**根会话**（团队挂在领队那个会话上）。
+			const sessionId = useCurrentSessionId(store)
+			const teamSessionId = teamSessionIdOf(store, sessionId)
+			// **等权威会话**：初次挂载时 `uiSession.current` 还没 publish，`resolveCurrentSessionId` 会落到
+			// "上次保留的旧会话"；拿它去问会报「会话 … 现在不活着」。等这一拍再取。
+			const ready = useSessionAuthority()
+			const target = ready ? membersUrlOf(workspace, teamSessionId) : ''
+			const [snapshot, setSnapshot] = React.useState({ phase: 'loading' })
+			const [localTick, setLocalTick] = React.useState(0)
+			// 三个筛选：身份 chip（全部 / 协调者 / 已停用）+ 运行时状态下拉 + 搜索；
+			// 一排只放一个 facet、同级互斥（不能再叠加），键形如 `lead` / `disabled` / `runtime:inactive`。
+			const [memberFacet, setMemberFacet] = React.useState('all')
+			const [query, setQuery] = React.useState('')
+			// 块顶回执（设计 ⑥.1）：`{ tone, lines, retry? }`；**下一次同块动作开始时先清旧的**。
+			const [notice, setNotice] = React.useState(null)
+			// 正在发的那个动词（`名字:动词`）—— 只用来禁用同一张卡上的按钮。
+			const [memberBusy, setMemberBusy] = React.useState(null)
+			// 确认浮窗（打断 / 智能体团队开关）：`null` = 没开；开着时带 `{ kind, name, busy, error }`。
+			const [confirm, setConfirm] = React.useState(null)
+			// 防重复提交的**同步**闸：两次点击落在同一轮里时 state 还没更新，只有 ref 顶得住。
+			const busyRef = React.useRef(false)
+			// 最近的跨角色交接单（`/collab`，只读辅助信息；拿不到就不显示那一行）。
+			const [handoffNotes, setHandoffNotes] = React.useState([])
+			// 上下文详情页：`null` = 列表态；否则 `{ row, key, rect, reduced, motion }`。
+			// **同一时刻只允许一个**（003 §3.3）：`openRef` 是同步闸（两次点击落在同一轮里时 state 还没更新）。
+			const [detail, setDetail] = React.useState(null)
+			const openRef = React.useRef(false)
+			// 已结束成员的**末次读数缓存**（v2.2 §13.4）：本会话打开过才有；内存、30 秒、不落盘。
+			const [lastReadings, setLastReadings] = React.useState({})
+			const rememberReadingOf = (memberId, reading) => {
+				if (memberId === '') return
+				setLastReadings((current) => ({ ...current, [memberId]: reading }))
+			}
+			const showSkeleton = useSkeletonVisible(snapshot.phase === 'loading')
+
+			React.useEffect(() => {
+				if (!active || !ready) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setSnapshot({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				// **重取失败不覆盖旧数据**（设计 ⑥.3）：手里已有读数时保留它，只标 `stale`。
+				getJsonCached(target)
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null) {
+							setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true, staleReason: 'HTTP ' + response.status + '：响应不是 JSON' } : { phase: 'error', error: 'HTTP ' + response.status + '：响应不是 JSON' }))
+							return
+						}
+						if (payload.ok === true) {
+							setSnapshot({ phase: 'ready', data: payload })
+							return
+						}
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true, staleReason: typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status } : { phase: 'error', error: typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status }))
+					})
+					.catch((error) => {
+						if (cancelled) return
+						setSnapshot((current) => (current.phase === 'ready' ? { phase: 'ready', data: current.data, stale: true, staleReason: '' + error } : { phase: 'error', error: '' + error }))
+					})
+				return () => {
+					cancelled = true
+				}
+				// props.reload：面板的重读计数；localTick：本块那几个动作之后自己重取；active：只有当前块取数。
+			}, [props.reload, localTick, target, active, ready])
+
+			// 最近交接：与名册并行取；失败静默（辅助信息，不挡成员卡）。
+			React.useEffect(() => {
+				if (!active || !ready) return () => {}
+				let cancelled = false
+				if (typeof fetch !== 'function') return () => {}
+				getJsonCached(collabUrlOf(workspace, teamSessionId))
+					.then((response) => response.json().then((payload) => payload, () => null))
+					.then((payload) => {
+						if (cancelled) return
+						setHandoffNotes(payload !== null && payload.ok === true && Array.isArray(payload.handoffs) ? payload.handoffs : [])
+					})
+					.catch(() => {
+						if (!cancelled) setHandoffNotes([])
+					})
+				return () => {
+					cancelled = true
+				}
+			}, [props.reload, localTick, workspace, teamSessionId, active, ready])
+
+			const data = snapshot.phase === 'ready' ? snapshot.data : null
+			// **主表 = 原生名册那一份**（`merged`）：task-40 起这是**唯一**来源。
+			const rows = data !== null && Array.isArray(data.merged) ? data.merged : []
+			const team = data !== null && data.team !== undefined && data.team !== null && typeof data.team === 'object' ? data.team : null
+			const teamAvailable = team !== null && team.available === true
+			const warnings = data !== null && Array.isArray(data.warnings) ? data.warnings : []
+
+			const runtimeWordOf = (value) => MEMBER_RUNTIME_WORDS[value] ?? (value === '' ? '（未记）' : value)
+			const runtimeValues = facetValuesOf(rows, 'runtime')
+			// 身份与运行时值同级互斥、只留一枚「全部」；每项带自己的计数口径（重叠成员各自计入）。
+			const memberFacets = [
+				{ key: 'all', label: '全部', match: () => true },
+				...MEMBER_STAGES.filter((spec) => spec.key !== 'all').map((spec) => ({ key: spec.key, label: spec.label, match: spec.match })),
+				...runtimeValues.map((value) => ({
+					key: 'runtime:' + (value === '' ? 'none' : value),
+					label: runtimeWordOf(value),
+					match: (row) => text(row.runtime) === value,
+				})),
+			]
+			const memberFacetSpec = memberFacets.find((spec) => spec.key === memberFacet) ?? memberFacets[0]
+			const memberFacetCount = (spec) => rows.filter((row) => spec.match(row)).length
+			const needle = query.trim().toLowerCase()
+			const visible = rows.filter((row) => memberFacetSpec.match(row) && (needle === '' || haystackOf(row).indexOf(needle) !== -1))
+
+			/**
+			 * 成员那三个动词的发送器（**停用 / 恢复 / 打断**）：POST 之后重取这一块（`localTick`）。
+			 *
+			 * 服务端给动词（`row.verbs`），客户端只负责发与说结果；回执里 `note` **原样**印出来。
+			 * 失败时**不动列表 / 徽标**（设计 ⑥.3：不做乐观更新），给「重试」；`opts.onFailure`
+			 * 用来把失败留在**确认浮窗内**（打断那条：浮窗失败时不关）。
+			 * @param url - 端点。
+			 * @param name - 成员名。
+			 * @param verb - 中文动词（回执兜底文案用）。
+			 * @param opts - `{ onSuccess, onFailure }`。
+			 */
+			const postMemberVerb = (url, name, verb, opts) => {
+				const options = opts === undefined || opts === null ? {} : opts
+				if (busyRef.current) return
+				busyRef.current = true
+				if (typeof fetch !== 'function') {
+					busyRef.current = false
+					setNotice({ tone: 'error', lines: ['当前环境没有 fetch'] })
+					return
+				}
+				setMemberBusy(name + ':' + verb)
+				setNotice(null)
+				fetch(url + paneQueryOf(workspace, teamSessionId), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ name }),
+				})
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						busyRef.current = false
+						setMemberBusy(null)
+						if (payload !== null && payload.ok === true) {
+							setNotice({ tone: 'ok', lines: [text(payload.note) === '' ? verb + '成功：' + name : text(payload.note)] })
+							invalidatePanes()
+							setLocalTick((value) => value + 1)
+							if (typeof options.onSuccess === 'function') options.onSuccess(payload)
+							return
+						}
+						const line = payload !== null && text(payload.error) !== '' ? text(payload.error) : 'HTTP ' + String(response === undefined ? '' : response.status)
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(line)
+							return
+						}
+						setNotice({ tone: 'error', lines: [line], retry: () => postMemberVerb(url, name, verb, options) })
+					})
+					.catch((error) => {
+						busyRef.current = false
+						setMemberBusy(null)
+						const line = '发不出去：' + String(error && error.message ? error.message : error)
+						if (typeof options.onFailure === 'function') {
+							options.onFailure(line)
+							return
+						}
+						setNotice({ tone: 'error', lines: [line], retry: () => postMemberVerb(url, name, verb, options) })
+					})
+			}
+			/**
+			 * 卡上那三个动词的按钮：**只看载荷给的 `verbs`**（服务端判过"现在能不能做"，客户端不猜）。
+			 *
+			 * 不能做（`spec.ok !== true`）时**不用原生 `disabled`**：改用 `aria-disabled` + `aria-describedby`
+			 * 指向一枚视觉隐藏的理由（`spec.why` 原文），点击只把理由送进块顶回执、**不发请求**
+			 * （设计 P-05：键盘与触摸都拿得到理由，title 不再是唯一入口）。
+			 * @param row - 成员行。
+			 * @param name - 成员名。
+			 * @returns 节点数组（按钮 + 视觉隐藏的理由）。
+			 */
+			const verbButtonsOf = (row, name) => {
+				const verbs = row !== null && row !== undefined && row.verbs !== null && row.verbs !== undefined ? row.verbs : {}
+				const busy = memberBusy !== null && String(memberBusy).indexOf(name + ':') === 0
+				const buttonOf = (key, label, verb, url) => {
+					const spec = verbs[verb]
+					// **载荷没给这一格 ⇒ 不画**（那件事在这个上下文里不存在）。
+					if (spec === null || spec === undefined) return null
+					const why = text(spec.why)
+					const unavailable = spec.ok !== true
+					const whyId = 'cbv-mem-why-' + String(name).replace(/[^A-Za-z0-9_-]/g, '-') + '-' + verb
+					const button = el(
+						'button',
+						{
+							className: 'cbv-cardbtn' + (unavailable ? ' cbv-cardbtn--off' : ''),
+							key,
+							type: 'button',
+							// 临时不可用（正在执行）仍用原生 disabled；条件不允许用 aria-disabled（还能聚焦、能听见理由）。
+							disabled: busy,
+							'aria-disabled': unavailable ? 'true' : undefined,
+							'aria-describedby': unavailable && why !== '' ? whyId : undefined,
+							'data-member-verb': verb,
+							'data-member-name': name,
+							'data-member-verb-ok': unavailable ? 'false' : 'true',
+							...(why === '' ? {} : { title: why }),
+							onClick: () => {
+								if (busyRef.current) return
+								if (unavailable) {
+									setNotice({ tone: 'ok', lines: [why === '' ? '这个动作现在不可用。' : why] })
+									return
+								}
+								// **打断**会中止当前一轮 ⇒ 先进确认浮窗（取消则零 POST）。
+								if (verb === 'interrupt') {
+									setNotice(null)
+									setConfirm({ kind: 'interrupt', name, busy: false, error: '' })
+									return
+								}
+								postMemberVerb(url, name, label)
+							},
+						},
+						label,
+					)
+					// 理由单独一根节点（`aria-describedby` 指过来）；不塞进按钮内部，免得重复进可访问名。
+					// 理由节点走 markdown 渲染：`spec.why` 原文里带 `**` / 反引号，直接当文本印会在界面上露出标记。
+					const whyNode = unavailable && why !== '' ? el('span', { className: 'cbv-sr-only', id: whyId, key: whyId }, markdownNodes(why, whyId)) : null
+					return [button, whyNode]
+				}
+				return [
+					buttonOf('disable', '停用', 'disable', MEMBERS_DISABLE_ENDPOINT),
+					buttonOf('restore', '恢复', 'restore', MEMBERS_RESTORE_ENDPOINT),
+					buttonOf('interrupt', '打断', 'interrupt', MEMBERS_INTERRUPT_ENDPOINT),
+				].flat()
+			}
+
+			/** 确认浮窗「确认」：**只有走到这里才发请求**（现在只剩「打断」还需要确认）。 */
+			const runConfirm = () => {
+				if (confirm === null || confirm.busy === true) return
+				const current = confirm
+				if (current.kind !== 'interrupt') return
+				setConfirm({ ...current, busy: true, error: '' })
+				postMemberVerb(MEMBERS_INTERRUPT_ENDPOINT, current.name, '打断', {
+					onSuccess: () => setConfirm(null),
+					onFailure: (line) => setConfirm((now) => (now === null ? now : { ...now, busy: false, error: line })),
+				})
+			}
+			const confirmSpecOf = () => {
+				if (confirm === null || confirm.kind !== 'interrupt') return { open: false }
+				return {
+					open: true,
+					title: '打断 ' + confirm.name + ' 当前这一轮？',
+					lines: ['只打断它当前这一轮。收件箱里的消息保留；原生名册与两条上限不变；下次 `member_send` 唤醒它照旧接着干。'],
+					confirmLabel: '打断',
+					busyLabel: '打断中…',
+					danger: false,
+					busy: confirm.busy === true,
+					error: confirm.error,
+				}
+			}
+
+			/**
+			 * 卡上「上下文占用」常驻行（v2 起它是**入口**：`›`、无 `aria-expanded`，点它打开详情页）。
+			 *
+			 * 六态的判定在载荷里（`row.contextOccupancy.state`，唯一实现 `occupancyOf`）：
+			 *   · `no-service` / 没有这一格 ⇒ **整行不画**（① 服务缺失，块顶有 C7 告警）；
+			 *   · `absent` / `error` ⇒ `button[disabled]` + `title` 给理由（②⑥）；
+			 *   · `no-request` / `no-window` / `ready` ⇒ 可点（③④⑤）；整块重取失败时 `ready` 显示为 `stale`（⑦）。
+			 * 已结束成员另有两条来源（003 v2.5 §1.16）：载荷里的**持久投影缓存**读数（`source:'cache'`，
+			 * 零 I/O、首屏就有）显示 `38%（末次）` + P28；本会话打开过详情页后，内存缓存（30s）以详情页为准（P16）。
+			 * @param row - 成员行。
+			 * @param name - 成员名（可访问名用）。
+			 * @param cardKey - 卡片稳定标识（与 `data-mem-key` 同一份）。
+			 * @returns 节点或 null（不画）。
+			 */
+			const ctxRowOf = (row, name, cardKey) => {
+				const occupancy = ctxOccupancyOf(row)
+				if (occupancy === null) return null
+				const serverState = text(occupancy.state)
+				if (serverState === '' || serverState === 'no-service') return null
+				const stale = snapshot.stale === true && (serverState === 'ready' || serverState === 'no-window' || serverState === 'no-request')
+				let state = stale && serverState === 'ready' ? 'stale' : serverState
+				// 已结束成员的两条来源（003 v2.5 §1.16）：① 载荷里的投影缓存读数（`source:'cache'`）；
+				// ② 本会话打开过详情页后的 30s 内存缓存（`lastReadings`）。详情页读的是日志尾，
+				// `asOfSeq` 只会 ≥ 缓存切口 ⇒ 相等或更新时以它为准（两处同源）。
+				const cacheReading = text(occupancy.source) === 'cache' && occupancy.ended === true
+				const memberId = text(row.session)
+				const remembered = lastReadings[memberId]
+				const freshReading = remembered !== undefined && Date.now() - remembered.at < 30000 ? remembered : null
+				const detailSupersedes =
+					freshReading !== null &&
+					(typeof occupancy.asOfSeq !== 'number' || typeof freshReading.asOfSeq !== 'number' || freshReading.asOfSeq >= occupancy.asOfSeq)
+				const lastReading = (serverState === 'absent' || cacheReading) && detailSupersedes ? freshReading : null
+				// 不在场分两种：创建中 / 失败 —— 还没有会话可读，保持运行时词、不可点；
+				// 其余「不在场」意味着可能留下过落盘会话 ⇒ 给 P19 让入口可点（读了再判 ended / notFound）。
+				const runtimeWord = text(row.runtime)
+				const noSessionYet = runtimeWord === 'provisioning' || runtimeWord === 'failed'
+				if (serverState === 'absent' && lastReading === null && !noSessionYet) state = 'absent-ended'
+				// 缓存读数只改 `ready` 这一态的名字（`no-request` / `no-window` 照原样说，不冒充有百分比）。
+				if (cacheReading && lastReading === null && serverState === 'ready') state = 'ended-cache'
+				if (lastReading !== null) state = 'ended'
+				const clickable =
+					state === 'ready' || state === 'stale' || state === 'no-request' || state === 'no-window' || state === 'absent-ended' || state === 'ended' || state === 'ended-cache' || state === 'error'
+				const used = lastReading !== null ? lastReading.used : ctxUsedOf(occupancy)
+				const percent =
+					lastReading !== null
+						? lastReading.percent
+						: state === 'ready' || state === 'stale' || state === 'ended-cache'
+							? ctxPercentOf(used, occupancy.contextWindow)
+							: null
+				const segments = lastReading !== null
+					? lastReading.segments
+					: {
+							system: occupancy.systemTokens,
+							tools: occupancy.toolsTokens,
+							messages: occupancy.messageTokens,
+						}
+				const barSegs = percent === null ? [] : ctxBarSegsOf(percent, segments)
+				const label = el('span', { className: 'cbv-mp-ctx-label', key: 'label' }, '上下文占用')
+				const textOfState =
+					state === 'no-request'
+						? el('span', { className: 'cbv-mp-ctx-state', key: 'state' }, '—（还没跑过请求）')
+						: state === 'no-window'
+							? el('span', { className: 'cbv-mp-ctx-state', key: 'state' }, '—（容量未知）')
+							: state === 'absent-ended'
+								? el('span', { className: 'cbv-mp-ctx-state', key: 'state', 'data-mem-ctx-ended': '' }, '—（已结束，点开看末次读数）')
+								: state === 'absent'
+									? el('span', { className: 'cbv-mp-ctx-state', key: 'state' }, '—（' + ctxAbsentWordOf(text(row.runtime)) + '）')
+									: state === 'error'
+										? el('span', { className: 'cbv-mp-ctx-state', key: 'state' }, '读不到（' + text(occupancy.reason) + '）')
+										: null
+				const kids = [label]
+				if (percent !== null) {
+					kids.push(el('span', { className: 'cbv-mp-ctx-pct', key: 'pct' }, percent + '%'))
+					if (state === 'stale') kids.push(el('span', { className: 'cbv-mp-ctx-sep', key: 'sep', 'aria-hidden': 'true' }, '·'))
+					// P18：末次读数的后缀（已结束成员：缓存读数与本次会话读过的读数都算）。
+					if (state === 'ended' || state === 'ended-cache')
+						kids.push(el('span', { className: 'cbv-mp-ctx-sep', key: 'ended-suffix', 'data-mem-ctx-suffix': 'ended' }, '（末次）'))
+					kids.push(
+						el(
+							'span',
+							{ className: 'cbv-mp-ctx-bar', key: 'bar', 'aria-hidden': 'true' },
+							barSegs.map((seg) =>
+								el('span', { className: 'cbv-mp-ctx-seg', key: seg.key, style: { width: seg.width.toFixed(2) + '%', background: seg.color } }),
+							),
+						),
+					)
+					kids.push(el('span', { className: 'cbv-mp-ctx-caret', key: 'caret', 'aria-hidden': 'true' }, '›'))
+				} else {
+					kids.push(textOfState)
+					if (clickable) kids.push(el('span', { className: 'cbv-mp-ctx-caret', key: 'caret', 'aria-hidden': 'true' }, '›'))
+				}
+				const title =
+					state === 'ended'
+						? '它已经结束：显示最后一次落盘读数（' + ctxClockOf(lastReading === null ? '' : lastReading.asOfTime) + '），不会再变。'
+						: state === 'ended-cache' || (cacheReading && lastReading === null)
+							? CTX_TEXT.endedCacheTitle(text(occupancy.asOfSeq) === '' ? '—' : text(occupancy.asOfSeq))
+							: state === 'stale'
+								? '上次读数；本次重取失败：' + (snapshot.staleReason === '' || snapshot.staleReason === undefined ? '原因读不到' : snapshot.staleReason)
+								: state === 'absent'
+									? CTX_TEXT.absentTitle
+									: state === 'error'
+										? text(occupancy.reason)
+										: undefined
+				const props = {
+					className: 'cbv-mp-ctx',
+					key: 'ctx',
+					type: 'button',
+					'data-mem-ctx': state,
+					...(title === undefined ? {} : { title }),
+				}
+				if (clickable) {
+					props['data-toggle'] = ''
+					// 语义从"展开"变"进入"：可访问名说清去哪儿（003 §⑥）。
+					props['aria-label'] = '查看 ' + (name === '' ? '这位成员' : name) + ' 的上下文详情'
+					// 页面上 `aria-controls` 指向页面标题（真实存在，仅打开时）；
+					// 详情页卸载后那个 id 不在 DOM 里，所以只用 `aria-haspopup` 语义不及 `aria-controls` 稳定 ——
+					// 这里不设 `aria-controls`：它不指向一个"一直存在的元素"。
+					props.onClick = (event) => {
+						if (event !== null && event !== undefined && typeof event.stopPropagation === 'function') event.stopPropagation()
+						openDetailOf(row, event)
+					}
+				} else {
+					props.disabled = true
+				}
+				return el('button', props, ...kids)
+			}
+
+			/**
+			 * 一张成员卡：**只读 live 字段**（卡上不再有任何来自旧名册文件的东西）。
+			 */
+			const cardOf = (row, index) => {
+				const name = text(row.name)
+				const runtime = text(row.runtime)
+				const runtimeTone = runtime === 'running' ? 'present' : runtime === 'failed' ? 'warn' : 'ok'
+				const disabled = row.disabled === true
+				const avatar = text(row.avatar) === '' ? (row.kind === 'lead' ? 'target' : 'user') : text(row.avatar)
+				const tone = text(row.avatarTone) === '' ? (row.kind === 'lead' ? 'exec' : 'eng') : text(row.avatarTone)
+				const duty = text(row.description)
+				const identity = row.kind === 'lead' ? '协调者' : '队友'
+				const cardKey = row.key === undefined ? 'mem' + index + '#' + name : row.key
+				return el(
+					'div',
+					{
+						className: 'cbv-box cbv-mp-card cbv-mp-card--entry' + (disabled ? ' cbv-mp-card--off' : ''),
+						key: cardKey,
+						'data-mem-kind': text(row.kind),
+						'data-mem-name': name,
+						'data-mem-id': text(row.session),
+						'data-mem-key': cardKey,
+						'data-mem-runtime': runtime === '' ? 'unknown' : runtime,
+						'data-mem-disabled': disabled ? 'true' : 'false',
+						// **整卡可点**（人的指令）：除动作条外任何位置都打开详情（指针便利）。
+						// 键盘仍只有常驻行那一枚 `button` 这一条明确路径（卡里还有三个按钮，不能嵌套交互控件）。
+						onClick: (event) => openDetailOf(row, event),
+					},
+					el(
+						'div',
+						{ className: 'cbv-mp-top', key: 'top' },
+						el('span', { className: 'cbv-mp-avatar cbv-mp-avatar--' + tone, key: 'av' }, avatarIconOf(avatar)),
+						el(
+							'div',
+							{ className: 'cbv-mp-nameblock', key: 'names' },
+							el('div', { className: 'cbv-mp-name', key: 'name' }, name === '' ? '（无名）' : name),
+							el(
+								'div',
+								{ className: 'cbv-badges', key: 'badges' },
+								el('span', { className: 'cbv-badge' + (row.kind === 'lead' ? ' cbv-badge--present' : ''), key: 'kind' }, identity),
+								runtime === '' ? null : el('span', { className: 'cbv-badge cbv-badge--' + runtimeTone, key: 'runtime' }, runtimeWordOf(runtime)),
+								disabled
+									? el(
+											'span',
+											{
+												className: 'cbv-badge cbv-badge--warn',
+												key: 'disabled',
+												'data-mem-disabled-badge': 'true',
+												title: '本插件不再派活给它（不占角色槽位）；它在宿主原生界面里仍然可以打开对话',
+											},
+											'已停用',
+										)
+									: null,
+							),
+							// 人要求：卡片不再展示「会话 …」那一段。模型 / 提供者 / 上下文照旧拼成一行，全空就整行不画。
+							(() => {
+								const metaParts = []
+								if (text(row.model) !== '') metaParts.push('模型 ' + text(row.model))
+								if (text(row.provider) !== '') metaParts.push('提供者 ' + text(row.provider))
+								if (text(row.context) !== '') metaParts.push('继承方式 ' + text(row.context))
+								return metaParts.length === 0 ? null : el('div', { className: 'cbv-mp-sub', key: 'sub' }, metaParts.join(' · '))
+							})(),
+						),
+					),
+					// 上下文占用常驻行：身份之后、职责之前（001 §3.1：一眼判断快没满）。
+					ctxRowOf(row, name, cardKey),
+					el(
+						'div',
+						{ className: 'cbv-mp-duty', key: 'duty' },
+						duty !== '' ? duty : row.kind === 'lead' ? '拆解 · 派发 · 把关 · 收口' : '（原生没给这一条的 description）',
+					),
+
+					// 最近交接：这一位最近一次作为接收方（`to`）或发出方（`from`）；没有就不画这一行。
+					(() => {
+						const roleId = text(row.roleId)
+						const note = handoffNotes
+							.slice()
+							.reverse()
+							.find((item) => text(item.to) === name || (roleId !== '' && text(item.to) === roleId) || text(item.from) === name)
+						if (note === undefined) return null
+						return el(
+							'div',
+							{ className: 'cbv-mp-row', key: 'handoff' },
+							el('span', { className: 'cbv-mp-key', key: 'k' }, '最近交接 '),
+							`${text(note.from)} → ${text(note.to)}：${text(note.artifact)}`,
+						)
+					})(),
+					// 动作条：三个动词由服务端给（`row.verbs`）；不能做的也画出来（`aria-disabled` + 理由）。
+					(() => {
+						const actions = verbButtonsOf(row, name).filter((node) => node !== null && node !== undefined)
+						// 动作条里的三个动词不打开详情页（`stopPropagation`；键盘 Enter 也只触发那一个动词）。
+						return actions.length === 0
+							? null
+							: el('div', { className: 'cbv-cardbar', key: 'actions', onClick: (event) => event.stopPropagation() }, ...actions)
+					})(),
+				)
+			}
+
+			// **落空与读失败都给人下一步**：前者清掉筛选，后者当场重读一次。
+			const clearFilters = () => {
+				setMemberFacet('all')
+				setQuery('')
+			}
+			const retry = () => {
+				invalidatePanes()
+				setLocalTick((value) => value + 1)
+			}
+
+			/**
+			 * 打开详情页：记下卡片矩形（FLIP 的 `first`）与 reduced-motion，状态置 `opening`。
+			 * 动画期间（`opening` / `closing`）的新打开请求**直接忽略，不排队**（003 §3.3）。
+			 * @param row - 成员行。
+			 * @param event - 触发事件（取卡片矩形用；键盘走常驻行那枚 button）。
+			 */
+			const openDetailOf = (row, event) => {
+				if (openRef.current === true) return
+				openRef.current = true
+				let rect = null
+				try {
+					let node = event === null || event === undefined ? null : event.currentTarget
+					if (node !== null && node !== undefined && typeof node.closest === 'function') {
+						const card = node.closest('.cbv-mp-card')
+						if (card !== null && card !== undefined) node = card
+					}
+					if (node !== null && node !== undefined && typeof node.getBoundingClientRect === 'function') {
+						const box = node.getBoundingClientRect()
+						if (box.width > 0 && box.height > 0) rect = { x: box.left, y: box.top, width: box.width, height: box.height }
+					}
+				} catch {}
+				let reduced = false
+				try {
+					reduced = typeof window !== 'undefined' && window !== null && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches === true
+				} catch {}
+				setDetail({ row, key: text(row?.key) === '' ? text(row?.name) : text(row.key), rect, reduced, motion: 'opening' })
+			}
+			/** 详情页动效状态推进（页面在 `transitionend` / 兜底计时器之后调）。 */
+			const setMotionOf = (motion) => {
+				setDetail((current) => (current === null ? current : { ...current, motion }))
+			}
+			/** 关闭：先走反向动画，页面在结束时调 `finishCloseOf` 卸载。 */
+			const closeDetailOf = () => {
+				setDetail((current) => (current === null ? current : { ...current, motion: 'closing' }))
+			}
+			/** 动画结束：卸载页面、重挂列表，并把焦点还给原来那张卡（003 §3.1）。 */
+			const finishCloseOf = () => {
+				const key = detail === null ? '' : detail.key
+				openRef.current = false
+				setDetail(null)
+				try {
+					const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (run) => setTimeout(run, 0)
+					raf(() => {
+						if (typeof document === 'undefined' || document === null || typeof document.querySelector !== 'function') return
+						const node = key === '' ? null : document.querySelector('[data-mem-key="' + String(key).replace(/["\\]/g, '\\$&') + '"]')
+						if (node !== null && node !== undefined) {
+							if (typeof node.focus === 'function') {
+								try {
+									node.focus({ preventScroll: true })
+								} catch {
+									node.focus()
+								}
+							}
+							if (typeof node.scrollIntoView === 'function') node.scrollIntoView({ block: 'nearest' })
+						}
+					})
+				} catch {}
+			}
+
+			// **页面态替换列表态**（两态互斥：列表卸载，因此不存在双滚动 / 两层焦点）。
+			if (detail !== null) {
+				return el(MemberContextPage, {
+					row: detail.row,
+					memberId: text(detail.row.session),
+					workspace,
+					teamSessionId,
+					rect: detail.rect,
+					reduced: detail.reduced,
+					motion: detail.motion,
+					onMotion: setMotionOf,
+					onClose: closeDetailOf,
+					onClosed: finishCloseOf,
+					onLastReading: rememberReadingOf,
+				})
+			}
+
+			// 加载态：**工具栏位置不动**（骨架与内容同一外层高度），3 张卡骨架（设计 5.3）。
+			if (snapshot.phase === 'loading') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-mp cbv-mp--pane', 'data-members-phase': 'loading', 'data-members-state': 'ok', 'data-members-mark': PANE_MARK },
+					el(
+						'div',
+						{ className: 'cbv-flt-bar', key: 'skeleton-toolbar', 'aria-hidden': 'true' },
+						el('span', { className: 'cbv-skel-chip cbv-skel-chip--wide', key: 'c0' }),
+						el('span', { className: 'cbv-skel-chip', key: 'c1' }),
+						el('span', { className: 'cbv-skel-search', key: 's' }),
+					),
+					el('span', { className: 'cbv-sr-only', key: 'say' }, '正在读取本会话的成员与 agent…'),
+					showSkeleton ? el(SkeletonList, { kind: 'members', label: '正在读取本会话的成员与 agent…' }) : null,
+				)
+			}
+			// 整块错误态：只印那一行错误 + 一枚「重读」，不渲染卡 / 条 / 数 —— "读不成"不等于"不存在"。
+			if (snapshot.phase === 'error') {
+				return el(
+					'div',
+					{ className: 'cbv-view cbv-mp cbv-mp--pane', 'data-members-phase': 'error', 'data-members-state': 'degraded', 'data-members-mark': PANE_MARK },
+					el('div', { className: 'cbv-msg cbv-msg--error' }, '读不到成员名册：' + snapshot.error),
+					el('button', { className: 'cbv-btn', key: 'retry', type: 'button', 'data-pane-retry': 'members', onClick: retry }, '重读'),
+				)
+			}
+
+			// 筛选行**永远画**：主表里有团队那一份（协调者至少一行），所以不存在"未建立时画出来就是筛完剩 0 张卡"。
+			const toolbar = el(
+				'div',
+				{ className: 'cbv-flt-bar', key: 'toolbar' },
+				el(
+					'span',
+					{ className: 'cbv-badges', key: 'facets', 'data-members-facets': '' + memberFacets.length },
+					memberFacets.map((spec) =>
+						el(
+							'button',
+							{
+								className: 'cbv-flt-chip' + (spec.key === memberFacetSpec.key ? ' cbv-flt-chip--on' : ''),
+								key: spec.key,
+								type: 'button',
+								'data-members-facet': spec.key,
+								'aria-pressed': spec.key === memberFacetSpec.key ? 'true' : 'false',
+								onClick: () => setMemberFacet(spec.key),
+							},
+							spec.label + ' ' + memberFacetCount(spec),
+						),
+					),
+				),
+				el('input', {
+					className: 'cbv-input cbv-flt-search',
+					key: 'query',
+					type: 'search',
+					value: query,
+					placeholder: '搜索：名字 / 编号 / 角色 / 职责 / 会话 / 模型…',
+					'aria-label': '搜索成员',
+					onChange: (event) => setQuery(event.target.value),
+					onKeyDown: (event) => {
+						// Esc 清空搜索并**保持焦点**（设计 4.1）。
+						if (event !== null && event !== undefined && event.key === 'Escape') {
+							event.preventDefault()
+							setQuery('')
+						}
+					},
+				}),
+			)
+
+			const nothingAtAll = rows.length === 0
+			const filteredOut = rows.length > 0 && visible.length === 0
+			const state = nothingAtAll ? 'empty' : filteredOut ? 'filtered' : warnings.length > 0 || !teamAvailable || snapshot.stale === true ? 'degraded' : 'ok'
+			const body = nothingAtAll
+				? el(
+						'div',
+						{ className: 'cbv-pane-empty', key: 'empty' },
+						teamAvailable
+							? '本会话的 agent 名册是空的（连协调者都没有 —— 这不正常，重启一下会话看看）。'
+							: '读不到本会话的 agent 名册 —— 见上面的告警。',
+						el('button', { className: 'cbv-btn', key: 'reload', type: 'button', 'data-empty-action': 'members-retry', onClick: retry }, '重读'),
+					)
+				: visible.length === 0
+					? el(
+							'div',
+							{ className: 'cbv-pane-empty cbv-pane-empty--filters', key: 'nofilter' },
+							el('span', { key: 'word' }, `没有匹配的条目（本会话共 ${rows.length} 条）。`),
+							el('button', { className: 'cbv-btn', key: 'clear', type: 'button', 'data-filters-clear': 'members', onClick: clearFilters }, '清除筛选'),
+						)
+					: el('div', { className: 'cbv-mp-grid', key: 'grid' }, visible.map((row, index) => cardOf(row, index)))
+
+			return el(
+				'div',
+				{
+					className: 'cbv-view cbv-mp cbv-mp--pane',
+					'data-members-mark': PANE_MARK,
+					'data-members-phase': 'ready',
+					'data-members-state': state,
+					'data-members-team': teamAvailable ? 'true' : 'false',
+					'data-members-rows': '' + rows.length,
+					'data-members-total': '' + rows.length,
+					'data-members-visible': '' + visible.length,
+				},
+				warnings.map((line, index) => el('div', { className: 'cbv-pane-warn cbv-md', key: 'warn' + index }, markdownNodes(line, 'members-warn' + index))),
+				snapshot.stale === true
+					? el(
+							'div',
+							{ className: 'cbv-pane-warn cbv-md', key: 'stale' },
+							markdownNodes('显示的是上一次读数（这一次没读到最新的）。', 'members-stale'),
+							el('button', { className: 'cbv-btn', key: 'stale-retry', type: 'button', 'data-stale-retry': 'members', onClick: retry }, '重读'),
+						)
+					: null,
+				toolbar,
+				// 回执紧贴工具栏下方（设计 P-14）：成功 `role=status`、失败 `role=alert`。
+				el(NoticeBar, {
+					slot: 'members',
+					tone: notice === null ? null : notice.tone,
+					lines: notice === null ? [] : notice.lines,
+					onRetry: notice === null ? undefined : notice.retry,
+					// 成功类回执（如「智能体团队已启用」）2 秒自动隐藏；**带重试的失败回执不自动隐藏**
+					// （那是让人决定要不要重试的，收起它等于把动作入口藏了）。
+					autoHideMs: notice !== null && notice.tone === 'ok' ? 2000 : 0,
+					onClose: () => setNotice(null),
+				}),
+				el('div', { className: 'cbv-scroll', key: 'scroll' }, body),
+				el(
+					ConfirmDialog,
+					{
+						...confirmSpecOf(),
+						slot: confirm === null ? 'members' : confirm.kind,
+						onConfirm: runConfirm,
+						onCancel: () => {
+							if (confirm !== null && confirm.busy === true) return
+							setConfirm(null)
+						},
+					},
+				),
+			)
+		}
+
+
+		// ── 消息摘要的片段串（v2.2 §1.12.4 规则表；数据面只给结构，串在这里按**固定顺序**拼）──
+
+		/** 一条 item 的摘要片段（` · ` 连接；`preview` 是「首 80 字」片段，digest 缺失时退回它）。 */
+		const ctxDigestTextOf = (item) => {
+			const preview = text(item === null || item === undefined ? '' : item.preview)
+			const digest = item !== null && item !== undefined && item.digest !== null && item.digest !== undefined && typeof item.digest === 'object' ? item.digest : null
+			if (digest === null) return preview.trim() === '' ? '空消息' : preview
+			const blocks = digest.blocks !== null && digest.blocks !== undefined && typeof digest.blocks === 'object' ? digest.blocks : {}
+			const chars = digest.chars !== null && digest.chars !== undefined && typeof digest.chars === 'object' ? digest.chars : {}
+			const fragments = []
+			// 1) 正文（永远在最前）
+			if (typeof blocks.text === 'number' && blocks.text > 0 && preview.trim() !== '') fragments.push(preview)
+			// 2) 推理（空推理块只计数、不出片段）
+			if (typeof blocks.reasoning === 'number' && blocks.reasoning > 0 && typeof chars.reasoning === 'number' && chars.reasoning > 0) {
+				fragments.push('推理 ≈' + chars.reasoning + ' 字符')
+			}
+			// 3) 工具调用
+			if (typeof blocks.toolCall === 'number' && blocks.toolCall > 0) {
+				const names = Array.isArray(digest.tools) ? digest.tools.filter((name) => text(name) !== '') : []
+				fragments.push('工具调用 ×' + blocks.toolCall + (names.length > 0 ? '（' + names.join(' / ') + '）' : ''))
+			}
+			// 4) 图片
+			if (typeof blocks.image === 'number' && blocks.image > 0) fragments.push('图片 ×' + blocks.image)
+			// 5) 工具增删
+			if (typeof blocks.toolChange === 'number' && blocks.toolChange > 0) {
+				// 规则 5 的格式：`工具增删 ×4（移除 interrupt_agent / member_wait）` —— 增/移除只在开头说一次。
+				const changes = Array.isArray(digest.toolChanges) ? digest.toolChanges : []
+				const names = changes
+					.map((change) => (change === null || change === undefined || typeof change !== 'object' ? '' : text(change.name)))
+					.filter((name) => name !== '')
+				const prefix = changes.length > 0 && changes[0] !== null && changes[0] !== undefined && changes[0].kind === 'add' ? '增' : '移除'
+				fragments.push('工具增删 ×' + blocks.toolChange + (names.length > 0 ? '（' + prefix + ' ' + names.join(' / ') + '）' : ''))
+			}
+			// 6) 其它块型
+			const others = Array.isArray(digest.others) ? digest.others : []
+			for (const other of others) {
+				if (other === null || other === undefined || typeof other !== 'object') continue
+				if (typeof other.count !== 'number' || other.count <= 0) continue
+				fragments.push(text(other.type) + ' ×' + other.count)
+			}
+			// 7) 一个可计入的块都没有
+			if (fragments.length === 0) fragments.push('空消息')
+			return fragments.join(' · ')
+		}
+
+		/** 七段里每一段的段头统计（`segmentDigest`）；没有这一格就返回 null。 */
+		const ctxSegmentDigestOf = (data, key) => {
+			if (data === null || data === undefined) return null
+			const all = data.segmentDigest
+			if (all === null || all === undefined || typeof all !== 'object') return null
+			const value = all[key]
+			return value !== null && value !== undefined && typeof value === 'object' ? value : null
+		}
+
+		/** P15：系统提示的中文说明（chars / paragraphs 缺时按 005 §七 简化）。 */
+		const ctxSystemNoteOf = (chars, paragraphs) => {
+			if (typeof chars !== 'number') return '正文与成员会话里一致，点「查看全文」只读展开。'
+			if (typeof paragraphs !== 'number') return '系统提示共 ' + chars + ' 字符；正文与成员会话里一致，点「查看全文」只读展开。'
+			return '系统提示共 ' + chars + ' 字符 / ' + paragraphs + ' 段；正文与成员会话里一致，点「查看全文」只读展开。'
+		}
+
+		/** 可见段（七段里 0 项的不列）；顺序固定，不按大小重排。 */
+		const ctxVisibleSegsOf = (data) => {
+			if (data === null || data === undefined) return []
+			const categories = data.categories !== null && data.categories !== undefined && typeof data.categories === 'object' ? data.categories : {}
+			const counts = data.counts !== null && data.counts !== undefined && typeof data.counts === 'object' ? data.counts : {}
+			return CTX_SEGMENTS.filter((spec) => (typeof counts[spec.key] === 'number' ? counts[spec.key] : 0) > 0 || (typeof categories[spec.key] === 'number' ? categories[spec.key] : 0) > 0)
+		}
+
+		/**
+		 * 成员上下文详情页（v3.1）：**面板内整页 + 主从联动**。
+		 *
+		 * 左栏是垂直 `tablist`（七行 = 名称 + 项数 + ≈token + 占比），右栏是唯一的 `tabpanel`
+		 * （只渲染**当前选中段**的段头 + 逐项）；`↑/↓` 立即切段、零请求，`Home/End` 不 wrap。
+		 * 窄档（≤420）两级：列表 ↔ 详情（`data-ctx-pane` 挂在页根与 `.cbv-ctx-flip`）。
+		 * 系统提示三态（预览 / 无预览兜底 / 按需全文）在「系统提示词」段的详情里。
+		 * 翻转仍用真实节点的 FLIP（不 portal / 不新增 z-index / 不 fixed）。
+		 * @param props - `{ row, memberId, workspace, teamSessionId, rect, reduced, motion, onMotion, onClose, onClosed, onLastReading }`。
+		 */
+		function MemberContextPage(props) {
+			const row = props.row === null || props.row === undefined ? {} : props.row
+			const motion = props.motion === 'opening' || props.motion === 'closing' ? props.motion : 'idle'
+			const reduced = props.reduced === true
+			const titleId = 'cbv-ctx-page-title'
+			const panelId = 'ctx-segpanel'
+			const titleRef = React.useRef(null)
+			const flipRef = React.useRef(null)
+			const tocRef = React.useRef(null)
+			const detailHeadRef = React.useRef(null)
+			const detailBodyRef = React.useRef(null)
+			const fulltextRef = React.useRef(null)
+			const actionRef = React.useRef(null)
+			const timersRef = React.useRef([])
+			const dataRef = React.useRef(null)
+			const fullCacheRef = React.useRef(null)
+			const pendingFullRef = React.useRef(false)
+			const reportedRef = React.useRef(false)
+			const [snapshot, setSnapshot] = React.useState({ phase: 'loading' })
+			// 重取失败但手里有旧读数（⑨ 态）：保留旧数据、页头横幅说清为什么。
+			const [stale, setStale] = React.useState(null)
+			const [tick, setTick] = React.useState(0)
+			// v3.1 主从联动的页面内状态（关闭页面即丢，不持久化）。
+			const [selected, setSelected] = React.useState('')
+			const [pane, setPane] = React.useState('list')
+			const [shownCount, setShownCount] = React.useState({})
+			const [sort, setSort] = React.useState('size')
+			// 系统提示全文的三态：`{ status: 'idle'|'loading'|'ready'|'error', text, chars, truncated, error }`。
+			const [fulltext, setFulltext] = React.useState({ status: 'idle', text: '', chars: null, truncated: false, error: '' })
+			// 逐项行（v3.2）：单开；`openItem` = `{ seq, status:'loading'|'ready'|'error'|'gone'|'empty', detail?, category?, error }`。
+			const [openItem, setOpenItem] = React.useState(null)
+			// 页面级 `(member,seq)` 缓存：同页已取过的不重发；切段 / 排序清空，翻页保留。
+			const itemCacheRef = React.useRef(new Map())
+			const itemSkeleton = useSkeletonVisible(openItem !== null && openItem.status === 'loading')
+			// Esc 分层：全文 → 窄档详情 → 关页。回调每轮换新，用 ref 让键盘处理器读到当前那份。
+			const escHandlerRef = React.useRef(null)
+			const rootRef = useModalA11y(true, () => {
+				const handler = escHandlerRef.current
+				if (typeof handler === 'function') handler()
+				else props.onClose()
+			})
+
+			// 首屏：打开页面读一次（`tick` 是「重取」）；全文不在这里取（A24）。
+			React.useEffect(() => {
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setSnapshot({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				const url = memberContextUrlOf(props.workspace, props.teamSessionId, props.memberId)
+				getJsonCached(url, { force: true })
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null || payload.ok !== true) {
+							const reason = payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status
+							if (dataRef.current !== null) setStale({ reason, at: dataRef.current.readAt })
+							else setSnapshot({ phase: 'error', error: reason })
+							return
+						}
+						setStale(null)
+						setSnapshot({ phase: 'ready', data: payload })
+					})
+					.catch((error) => {
+						if (cancelled) return
+						const reason = '' + error
+						if (dataRef.current !== null) setStale({ reason, at: dataRef.current.readAt })
+						else setSnapshot({ phase: 'error', error: reason })
+					})
+				return () => {
+					cancelled = true
+				}
+			}, [tick, props.memberId, props.workspace, props.teamSessionId])
+
+			const data = snapshot.phase === 'ready' ? snapshot.data : null
+			dataRef.current = data
+
+			/** 清掉动画的计时器（卸载时不留悬空 timer）。 */
+			const clearTimers = () => {
+				for (const timer of timersRef.current) {
+					try {
+						clearTimeout(timer)
+					} catch {}
+				}
+				timersRef.current = []
+			}
+			React.useEffect(() => () => clearTimers(), [])
+
+			const focusNodeOf = (ref) => {
+				try {
+					const node = ref === null || ref === undefined ? null : ref.current
+					if (node !== null && node !== undefined && typeof node.focus === 'function') node.focus({ preventScroll: true })
+				} catch {}
+			}
+			/** 打开完成后焦点落到页标题（读屏先读「<成员名> 的上下文详情」）。 */
+			const focusTitle = () => focusNodeOf(titleRef)
+
+			// 翻转编排：打开 t=0 量矩形 → 双 rAF 起跑（外层 160ms / 内层 120ms / 内容 140ms，延迟 60ms）；
+			// t=200 清内联样式、置 idle、移焦点。关闭反向：内容 40ms → 外层 120ms（40→160）/ 内层 90ms（70→160）。
+			useIsoLayoutEffect(() => {
+				const root = rootRef.current
+				const flip = flipRef.current
+				if (motion === 'opening') {
+					const rect = props.rect
+					if (reduced === true) {
+						props.onMotion('idle')
+						focusTitle()
+						return
+					}
+					if (root === null || flip === null) {
+						props.onMotion('idle')
+						focusTitle()
+						return
+					}
+					const last = typeof root.getBoundingClientRect === 'function' ? root.getBoundingClientRect() : null
+					if (rect === null || rect === undefined || last === null || !(last.width > 0 && last.height > 0)) {
+						// 取不到卡片矩形：跳过 FLIP，只做 140ms 淡入（003 §3.2）。
+						flip.style.opacity = '0'
+						ctxRafTwice(() => {
+							flip.style.transition = 'opacity 140ms var(--cbv-ease)'
+							flip.style.opacity = '1'
+							timersRef.current.push(
+								setTimeout(() => {
+									flip.style.opacity = ''
+									flip.style.transition = ''
+									props.onMotion('idle')
+									focusTitle()
+								}, 140),
+							)
+						})
+						return
+					}
+					root.style.transformOrigin = 'top left'
+					root.style.transform = 'translate(' + (rect.x - last.left) + 'px,' + (rect.y - last.top) + 'px) scale(' + (rect.width / last.width) + ',' + (rect.height / last.height) + ')'
+					flip.style.transformOrigin = 'top left'
+					flip.style.transform = 'rotateY(-90deg)'
+					flip.style.opacity = '0'
+					ctxRafTwice(() => {
+						root.style.transform = 'translate(0px,0px) scale(1,1)'
+						flip.style.transform = 'rotateY(0deg)'
+						const fade = setTimeout(() => {
+							flip.style.transition = 'opacity 140ms var(--cbv-ease)'
+							flip.style.opacity = '1'
+						}, 60)
+						const done = setTimeout(() => {
+							root.style.transform = ''
+							root.style.transformOrigin = ''
+							flip.style.transform = ''
+							flip.style.transformOrigin = ''
+							flip.style.opacity = ''
+							flip.style.transition = ''
+							props.onMotion('idle')
+							focusTitle()
+						}, 200)
+						timersRef.current.push(fade, done)
+					})
+					return
+				}
+				if (motion === 'closing') {
+					const rect = props.rect
+					if (reduced === true || rect === null || rect === undefined || root === null || flip === null) {
+						props.onClosed()
+						return
+					}
+					flip.style.transition = 'opacity 40ms var(--cbv-ease)'
+					flip.style.opacity = '0'
+					const out = setTimeout(() => {
+						let last = null
+						try {
+							last = typeof root.getBoundingClientRect === 'function' ? root.getBoundingClientRect() : null
+						} catch {}
+						if (last !== null && last.width > 0 && last.height > 0) {
+							root.style.transition = 'transform 120ms var(--cbv-ease)'
+							root.style.transformOrigin = 'top left'
+							root.style.transform = 'translate(' + (rect.x - last.left) + 'px,' + (rect.y - last.top) + 'px) scale(' + (rect.width / last.width) + ',' + (rect.height / last.height) + ')'
+							flip.style.transition = 'transform 90ms var(--cbv-ease)'
+							flip.style.transitionDelay = '30ms'
+							flip.style.transformOrigin = 'top left'
+							flip.style.transform = 'rotateY(90deg)'
+						}
+						timersRef.current.push(setTimeout(() => props.onClosed(), 120))
+					}, 40)
+					timersRef.current.push(out)
+				}
+			}, [motion])
+
+			// ── 派生状态 ──────────────────────────────────────────────────────────
+			const occupancy = data !== null && data.occupancy !== null && data.occupancy !== undefined && typeof data.occupancy === 'object' ? data.occupancy : null
+			const used = ctxUsedOf(occupancy)
+			const contextWindow = occupancy !== null && typeof occupancy.contextWindow === 'number' ? occupancy.contextWindow : null
+			const inheritedCount = data !== null && typeof data.inheritedEventCount === 'number' ? data.inheritedEventCount : 0
+			const reconcile = data !== null && data.reconcile !== null && data.reconcile !== undefined && typeof data.reconcile === 'object' ? data.reconcile : null
+			const reconcileDelta = reconcile !== null && typeof reconcile.delta === 'number' ? reconcile.delta : 0
+			const segments = occupancy !== null ? { system: occupancy.systemTokens, tools: occupancy.toolsTokens, messages: occupancy.messageTokens } : null
+			const percent = ctxPercentOf(used, contextWindow)
+			const ended = data !== null && data.ended === true
+			const ctxState = (() => {
+				if (stale !== null) return 'stale-after-open'
+				// 首读还没回来：**不设** `data-ctx-state`（值域里没有 loading）。
+				if (data === null) return snapshot.phase === 'error' ? 'l2' : ''
+				if (data.state === 'l2') return 'l2'
+				if (data.state === 'l3') return 'l3'
+				if (data.state === 'l1') return 'l1'
+				if (used === null) return 'no-request'
+				if (contextWindow === null) return 'no-window'
+				return 'ready'
+			})()
+			const reason = data !== null && typeof data.reason === 'string' && data.reason !== ''
+				? data.reason
+				: snapshot.phase === 'error'
+					? snapshot.error
+					: stale !== null
+						? stale.reason
+						: ''
+			const loading = snapshot.phase === 'loading'
+			const headName = text(row.name) === '' ? '这位成员' : text(row.name)
+			const runtimeWord = MEMBER_RUNTIME_WORDS[text(row.runtime)] ?? ''
+			const visibleSegments = ctxVisibleSegsOf(data)
+			// ⑨ stale-after-open：旧的七段/详情照常渲染（不遮罩），只在页头加 P7 横幅。
+			const masterDetail = ctxState === 'ready' || ctxState === 'no-request' || ctxState === 'no-window' || ctxState === 'stale-after-open'
+			// 默认选中第一个可见段；页面内记住（关闭即丢）；重取后该段若消失则回落到第一个可见段。
+			const selectedKey = visibleSegments.some((spec) => spec.key === selected) ? selected : visibleSegments.length > 0 ? visibleSegments[0].key : ''
+			const selectedSpec = visibleSegments.find((spec) => spec.key === selectedKey) ?? null
+			const categories = data !== null && data.categories !== null && typeof data.categories === 'object' ? data.categories : {}
+			const counts = data !== null && data.counts !== null && typeof data.counts === 'object' ? data.counts : {}
+			const items = data !== null && data.items !== null && typeof data.items === 'object' ? data.items : {}
+			const totals = data !== null && data.totals !== null && typeof data.totals === 'object' ? data.totals : {}
+			const allTools = data !== null && Array.isArray(data.tools) ? data.tools : []
+			const sortedTools = ctxSortedToolsOf(allTools, sort)
+			const tokensOf = (key) => (typeof categories[key] === 'number' ? categories[key] : 0)
+			const countOf = (key) => (typeof counts[key] === 'number' ? counts[key] : 0)
+			const totalOf = (key) => (typeof totals[key] === 'number' ? totals[key] : countOf(key))
+			const itemsOf = (key) => (Array.isArray(items[key]) ? items[key] : [])
+			const allTotal = CTX_SEGMENTS.reduce((sum, spec) => sum + tokensOf(spec.key), 0)
+
+			// 窄档判定：详情是否**独占**（左栏被容器查询藏起来）。DOM 不在（离线自检）时按宽档。
+			const narrowNow = () => {
+				try {
+					const toc = tocRef.current
+					if (toc !== null && toc !== undefined && typeof toc.offsetParent !== 'undefined') return toc.offsetParent === null
+				} catch {}
+				return false
+			}
+			/** 切段：纯前端状态变化（零请求）；`focusTab` 时把焦点移到新的 tab（selection follows focus）。 */
+			const selectSegOf = (key, focusTab) => {
+				if (key === '') return
+				setSelected(key)
+				if (focusTab === true) {
+					try {
+						if (typeof document !== 'undefined' && document !== null && typeof document.getElementById === 'function') {
+							const node = document.getElementById('ctx-tab-' + key)
+							if (node !== null && node !== undefined && typeof node.focus === 'function') node.focus()
+						}
+					} catch {}
+				}
+			}
+			/** 左栏键盘：↑/↓ 立即选中、Home/End 首尾、不 wrap；Enter/Space 在窄档进详情。 */
+			const onTocKeyDown = (event) => {
+				if (event === null || event === undefined) return
+				const keys = visibleSegments.map((spec) => spec.key)
+				if (keys.length === 0) return
+				const index = Math.max(0, keys.indexOf(selectedKey))
+				let next = -1
+				if (event.key === 'ArrowDown') next = Math.min(keys.length - 1, index + 1)
+				else if (event.key === 'ArrowUp') next = Math.max(0, index - 1)
+				else if (event.key === 'Home') next = 0
+				else if (event.key === 'End') next = keys.length - 1
+				if (next < 0) {
+					if ((event.key === 'Enter' || event.key === ' ') && selectedKey !== '') openDetailPaneOf(selectedKey)
+					return
+				}
+				if (typeof event.preventDefault === 'function') event.preventDefault()
+				selectSegOf(keys[next], true)
+			}
+			/** 窄档：进入详情态（宽档 CSS 不生效，状态无副作用）；窄档时把焦点移到段头 h2。 */
+			const openDetailPaneOf = (key) => {
+				selectSegOf(key, false)
+				setPane('detail')
+				ctxRafTwice(() => {
+					if (narrowNow()) focusNodeOf(detailHeadRef)
+				})
+			}
+			/** 窄档：返回列表态（选中项保持；焦点回选中行）。 */
+			const backToListOf = () => {
+				setPane('list')
+				ctxRafTwice(() => {
+					try {
+						if (typeof document !== 'undefined' && document !== null && typeof document.getElementById === 'function') {
+							const node = document.getElementById('ctx-tab-' + selectedKey)
+							if (node !== null && node !== undefined && typeof node.focus === 'function') node.focus()
+						}
+					} catch {}
+				})
+			}
+			// 切段时**重置详情区的滚位**（唯一允许的一处滚动操作；不做滚动定位）。
+			React.useEffect(() => {
+				const body = detailBodyRef.current
+				if (body !== null && body !== undefined) body.scrollTop = 0
+			}, [selectedKey])
+			// 逐项展开态：切段 / 排序**清空**（行集合或顺序变了），翻页**保留**（不在此依赖里）。
+			React.useEffect(() => {
+				setOpenItem(null)
+				itemCacheRef.current.clear()
+			}, [selectedKey, sort])
+			// 已结束成员：把末次读数交给卡片缓存（30s，内存；不落盘）。
+			// 带上 `asOfSeq`：卡片据此判"两处同一份"（003 v2.5 §1.16.5）—— 详情页读的是日志尾，
+			// 它的 `asOfSeq` 不得小于卡片那份缓存切口；相等时数值必须逐值相同。
+			React.useEffect(() => {
+				if (data === null || data.ended !== true || reportedRef.current === true) return
+				reportedRef.current = true
+				const readingUsed = ctxUsedOf(occupancy)
+				const readingPercent = ctxPercentOf(readingUsed, occupancy !== null && typeof occupancy.contextWindow === 'number' ? occupancy.contextWindow : null)
+				if (readingPercent === null || typeof props.onLastReading !== 'function') return
+				props.onLastReading(props.memberId, {
+					used: readingUsed,
+					percent: readingPercent,
+					segments: { system: occupancy.systemTokens, tools: occupancy.toolsTokens, messages: occupancy.messageTokens },
+					asOfTime: typeof data.asOfTime === 'string' ? data.asOfTime : data.readAt,
+					asOfSeq: occupancy !== null && typeof occupancy.asOfSeq === 'number' ? occupancy.asOfSeq : null,
+					at: Date.now(),
+				})
+			}, [data])
+
+			/** P20 / 收起：每页最多自动取一次；展开/收起/切段都不重发；重试是显式动作。 */
+			const toggleFulltextOf = () => {
+				if (fulltext.status === 'loading') return
+				if (fulltext.status !== 'idle') {
+					setFulltext({ status: 'idle', text: '', chars: null, truncated: false, error: '' })
+					ctxRafTwice(() => focusNodeOf(actionRef))
+					return
+				}
+				// 收起后再展开：本页取过一次就复用（A24：不重发）。
+				if (fullCacheRef.current !== null) {
+					setFulltext({ ...fullCacheRef.current })
+					ctxRafTwice(() => focusNodeOf(fulltextRef))
+					return
+				}
+				loadFulltextOf(false)
+			}
+			/** 取全文（`part=system-full`）：`retry` 为人点的重试（显式动作，不受"只取一次"限制）。 */
+			const loadFulltextOf = (retry) => {
+				if (pendingFullRef.current) return
+				if (!retry && fullCacheRef.current !== null) {
+					setFulltext({ ...fullCacheRef.current })
+					return
+				}
+				pendingFullRef.current = true
+				setFulltext({ status: 'loading', text: '', chars: null, truncated: false, error: '' })
+				if (typeof fetch !== 'function') {
+					pendingFullRef.current = false
+					setFulltext({ status: 'error', text: '', chars: null, truncated: false, error: '当前环境没有 fetch' })
+					return
+				}
+				const url = memberContextUrlOf(props.workspace, props.teamSessionId, props.memberId, 'system-full')
+				getJsonCached(url, { force: true })
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						pendingFullRef.current = false
+						if (payload === null || payload.ok !== true) {
+							const error = payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status
+							setFulltext({ status: 'error', text: '', chars: null, truncated: false, error })
+							return
+						}
+						if (typeof payload.fullText !== 'string') {
+							const error = typeof payload.fullTextError === 'string' && payload.fullTextError !== '' ? payload.fullTextError : '读不到系统提示全文。'
+							setFulltext({ status: 'error', text: '', chars: null, truncated: false, error })
+							return
+						}
+						const next = {
+							status: 'ready',
+							text: payload.fullText,
+							chars: typeof payload.chars === 'number' ? payload.chars : payload.fullText.length,
+							truncated: payload.fullTextTruncated === true,
+							error: '',
+						}
+						fullCacheRef.current = next
+						setFulltext(next)
+						ctxRafTwice(() => focusNodeOf(fulltextRef))
+					})
+					.catch((error) => {
+						pendingFullRef.current = false
+						setFulltext({ status: 'error', text: '', chars: null, truncated: false, error: '' + error })
+					})
+			}
+
+			// Esc 分层：①全文收起 ②窄档详情回列表 ③关页。
+			escHandlerRef.current = () => {
+				if (fulltext.status !== 'idle') {
+					setFulltext({ status: 'idle', text: '', chars: null, truncated: false, error: '' })
+					ctxRafTwice(() => focusNodeOf(actionRef))
+					return
+				}
+				if (openItem !== null) {
+					setOpenItem(null)
+					return
+				}
+				if (pane === 'detail' && narrowNow()) {
+					backToListOf()
+					return
+				}
+				props.onClose()
+			}
+
+			// ── 页头 ─────────────────────────────────────────────────────────────
+			const badges = []
+			if (data !== null && data.ended === true) badges.push(el('span', { className: 'cbv-badge', key: 'ended', 'data-ctx-ended-badge': '' }, '已结束'))
+			if (text(row.roleId) !== '') badges.push(el('span', { className: 'cbv-badge', key: 'role' }, text(row.roleId)))
+			if (runtimeWord !== '') badges.push(el('span', { className: 'cbv-badge cbv-badge--' + (text(row.runtime) === 'running' ? 'present' : text(row.runtime) === 'failed' ? 'warn' : 'ok'), key: 'runtime' }, runtimeWord))
+			if (row.disabled === true) badges.push(el('span', { className: 'cbv-badge cbv-badge--warn', key: 'disabled' }, '已停用'))
+
+			const head = el(
+				'div',
+				{ className: 'cbv-ctx-page-head', key: 'head' },
+				el('span', { className: 'cbv-ctx-avatar', key: 'avatar', 'aria-hidden': 'true' }, avatarIconOf(text(row.avatar))),
+				el(
+					'div',
+					{ className: 'cbv-ctx-headmain', key: 'main' },
+					el('h2', { className: 'cbv-ctx-title', id: titleId, key: 'title', ref: titleRef, tabIndex: -1 }, headName + ' 的上下文详情'),
+					badges.length === 0 ? null : el('div', { className: 'cbv-badges', key: 'badges' }, badges),
+				),
+				el(
+					'div',
+					{ className: 'cbv-ctx-head-actions', key: 'actions' },
+					// 末次读数的数据不会再变 ⇒ 不画「重取」（005 §六 / V15）；其余可重取态照旧。
+					ended
+						? null
+						: snapshot.phase === 'error' || ctxState === 'ready' || ctxState === 'l1' || ctxState === 'no-request' || ctxState === 'no-window' || ctxState === 'stale-after-open'
+							? el('button', { className: 'cbv-btn cbv-ctx-head-btn', key: 'retry', type: 'button', onClick: () => setTick((value) => value + 1) }, '重取')
+							: null,
+					// 人要求（2026-11-26）：去掉最右的「×」，把「‹ 成员」放到最右；页头只有这一个返回动作。
+					el('button', { className: 'cbv-btn cbv-ctx-head-btn', key: 'back', type: 'button', 'aria-label': '返回成员列表', onClick: () => props.onClose() }, '‹ 成员'),
+				),
+			)
+
+			const banner =
+				stale === null
+					? null
+					: el('div', { className: 'cbv-ctx-page-stale', key: 'banner', 'data-ctx-stale': 'true' }, '上次读数；本次重取失败：' + stale.reason)
+
+			// ── 顶部摘要 ─────────────────────────────────────────────────────────
+			const summaryKids = []
+			if (percent !== null) summaryKids.push(el('span', { className: 'cbv-ctx-pct', key: 'pct' }, percent + '%'))
+			if (loading) {
+				summaryKids.push(el('span', { className: 'cbv-ctx-used', key: 'loading' }, '正在读取…'))
+			} else if (ctxState === 'no-request') {
+				// 已结束成员没有"还没跑过请求"这回事（末次读数也可能是空）；有数才说。
+				if (!ended) summaryKids.push(el('span', { className: 'cbv-ctx-used', key: 'used' }, CTX_TEXT.noRequest))
+			} else if (ctxState !== 'l2' && ctxState !== 'l3' && used !== null) {
+				summaryKids.push(
+					el(
+						'span',
+						{ className: 'cbv-ctx-used', key: 'used' },
+						'已用 ' + ctxTokenTextOf(used) + ' / ' + (contextWindow !== null ? '容量 ' + ctxCountTextOf(contextWindow) : '容量未知'),
+					),
+				)
+			}
+			const barPercent = percent !== null ? percent : ctxState === 'no-window' && used !== null ? 100 : null
+			if (barPercent !== null && segments !== null) {
+				const barSegs = ctxBarSegsOf(barPercent, segments)
+				if (barSegs.length > 0) {
+					summaryKids.push(
+						el(
+							'span',
+							{ className: 'cbv-ctx-bar', key: 'bar', 'aria-hidden': 'true', 'data-capacity': ctxState === 'no-window' ? 'unknown' : undefined },
+							barSegs.map((seg) => el('span', { className: 'cbv-ctx-bar-seg', key: seg.key, style: { width: seg.width.toFixed(2) + '%', background: seg.color } })),
+						),
+					)
+				}
+			}
+			if (data !== null && ctxState !== 'stale-after-open' && ctxState !== 'l2' && ctxState !== 'l3') {
+				const asOfSource = typeof data.asOfTime === 'string' && data.asOfTime !== '' ? data.asOfTime : data.readAt
+				if (typeof asOfSource === 'string' && asOfSource !== '') {
+					const preparedNote = data.source === 'prepared' ? ' · 来自已落盘会话' : ''
+					summaryKids.push(
+						el('span', { className: 'cbv-ctx-asof', key: 'asof' }, '读数截至 ' + ctxClockOf(asOfSource) + '（会话 seq ' + text(data.asOfSeq) + '）' + preparedNote),
+					)
+				}
+			}
+			const summary = summaryKids.length === 0 ? null : el('div', { className: 'cbv-ctx-page-summary', key: 'summary' }, el('div', { className: 'cbv-ctx-sum-line', key: 'line' }, ...summaryKids))
+
+			// ── 逐项行（v3.2：可折叠；摘要片段串；`（无文本）` 不再出现）────────────────
+			const inheritBadgeOf = (item) => (inheritedCount > 0 && typeof item.seq === 'number' && item.seq < inheritedCount ? el('span', { className: 'cbv-ctx-kind', key: 'inherit' }, '继承') : null)
+			const ITEM_P27 = '这一项已不在当前表层（被压缩替换），没有可展开的详情。'
+			const itemDetailUrlOf = (seq) => memberContextUrlOf(props.workspace, props.teamSessionId, props.memberId, 'item') + '&seq=' + encodeURIComponent(String(seq))
+
+			/** 详情是否"空"（展开但没有任何可展示内容 ⇒ P30）。 */
+			const itemDetailEmptyOf = (detail) => {
+				if (detail === null || detail === undefined) return true
+				if (typeof detail.text === 'string' && detail.text.trim() !== '') return false
+				if (typeof detail.reasoning === 'string' && detail.reasoning.trim() !== '') return false
+				if (Array.isArray(detail.toolCalls) && detail.toolCalls.length > 0) return false
+				if (typeof detail.images === 'number' && detail.images > 0) return false
+				return true
+			}
+			/** 写回某条的状态（同时进页面缓存；只更新当前打开的那一条，防切段竞态）。 */
+			const finishItemOf = (seq, next) => {
+				itemCacheRef.current.set(seq, next)
+				setOpenItem((current) => (current !== null && current.seq === seq ? { seq, ...next } : current))
+			}
+			/** 取一条详情：`retry` 是显式动作（不受"同页一次"限制）；其余情况命中缓存就不发请求。 */
+			const loadItemOf = (seq, retry) => {
+				if (retry !== true) {
+					const cached = itemCacheRef.current.get(seq)
+					if (cached !== undefined) {
+						setOpenItem({ seq, ...cached })
+						return
+					}
+				}
+				setOpenItem({ seq, status: 'loading', detail: null, category: '', error: '' })
+				if (typeof fetch !== 'function') {
+					finishItemOf(seq, { status: 'error', detail: null, category: '', error: '当前环境没有 fetch' })
+					return
+				}
+				getJsonCached(itemDetailUrlOf(seq), { force: true })
+					.then((response) => response.json().then((payload) => ({ response, payload }), () => ({ response, payload: null })))
+					.then(({ response, payload }) => {
+						if (payload === null || payload.ok !== true) {
+							const error = payload !== null && typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status
+							finishItemOf(seq, { status: 'error', detail: null, category: '', error })
+							return
+						}
+						const category = typeof payload.category === 'string' ? payload.category : ''
+						if (payload.detail === null || payload.detail === undefined) {
+							const error = typeof payload.detailError === 'string' && payload.detailError !== '' ? payload.detailError : '读不到这一项的详情。'
+							finishItemOf(seq, { status: error === ITEM_P27 ? 'gone' : 'error', detail: null, category, error })
+							return
+						}
+						if (itemDetailEmptyOf(payload.detail)) {
+							finishItemOf(seq, { status: 'empty', detail: null, category, error: '' })
+							return
+						}
+						finishItemOf(seq, { status: 'ready', detail: payload.detail, category, error: '' })
+					})
+					.catch((error) => finishItemOf(seq, { status: 'error', detail: null, category: '', error: '' + error }))
+			}
+			/** 点一行：同一条再点为收起；否则单开（同段内自动收起上一条）。 */
+			const toggleItemOf = (seq) => {
+				if (openItem !== null && openItem.seq === seq) {
+					setOpenItem(null)
+					return
+				}
+				loadItemOf(seq, false)
+			}
+
+			/** 展开后的详情块内容（按类别排版；固定顺序、空节不画）。 */
+			const itemDetailNodesOf = (state) => {
+				if (state === null) return []
+				if (state.status === 'loading') {
+					return itemSkeleton ? [el('div', { className: 'cbv-ctx-skel', key: 'sk0' }), el('div', { className: 'cbv-ctx-skel', key: 'sk1' })] : []
+				}
+				if (state.status === 'gone') return [el('div', { className: 'cbv-ctx-detail-note', key: 'p27', 'data-ctx-item-error': 'gone' }, state.error)]
+				if (state.status === 'empty') return [el('div', { className: 'cbv-ctx-detail-note', key: 'p30' }, '这一项没有可展开的内容。')]
+				if (state.status === 'error') {
+					return [
+						el('div', { className: 'cbv-ctx-detail-note', key: 'p24', 'data-ctx-item-error': 'error' }, '读不到这一项的详情（' + (state.error === '' ? '原因读不到' : state.error) + '）；上面是摘要。'),
+						el('button', { className: 'cbv-btn cbv-ctx-action', key: 'retry-item', type: 'button', onClick: () => loadItemOf(state.seq, true) }, '重试'),
+					]
+				}
+				const detail = state.detail === null || state.detail === undefined ? {} : state.detail
+				const rows = []
+				const truncNoteOf = (chars, what) =>
+					el('div', { className: 'cbv-ctx-detail-note', key: 'p25' }, (what === '推理' ? '推理只显示前 50,000 字符' : '只显示前 50,000 字符') + '（原文 ' + text(chars) + ' 字符）。')
+				if (state.category === 'assistant') {
+					// P31 三节**固定顺序**：正文 / 推理 / 工具调用；空节不画。
+					if (typeof detail.text === 'string' && detail.text.trim() !== '') {
+						rows.push(el('div', { className: 'cbv-ctx-detail-label', key: 'label-text' }, '正文'))
+						rows.push(el('div', { className: 'cbv-ctx-detail-text', key: 'text' }, detail.text))
+						if (detail.textTruncated === true) rows.push(truncNoteOf(detail.textChars, '正文'))
+					}
+					if (typeof detail.reasoning === 'string' && detail.reasoning.trim() !== '') {
+						rows.push(el('div', { className: 'cbv-ctx-detail-label', key: 'label-reasoning' }, '推理'))
+						rows.push(el('div', { className: 'cbv-ctx-detail-text', key: 'reasoning' }, detail.reasoning))
+						if (detail.reasoningTruncated === true) rows.push(truncNoteOf(detail.reasoningChars, '推理'))
+					}
+					if (Array.isArray(detail.toolCalls) && detail.toolCalls.length > 0) {
+						const names = detail.toolCalls.map((call) => text(call === null || call === undefined ? '' : call.name)).filter((name) => name !== '')
+						const count = detail.toolCalls.length
+						const argsChars = typeof detail.toolArgsChars === 'number' ? detail.toolArgsChars : 0
+						rows.push(el('div', { className: 'cbv-ctx-detail-label', key: 'label-tools' }, '工具调用'))
+						// P26：只给次数 / 名字 / 参数规模；**参数内容一个字符都不展示**。
+						rows.push(el('div', { className: 'cbv-ctx-detail-text', key: 'tools', 'data-ctx-toolcalls': '' + count }, '工具调用 ×' + count + (names.length > 0 ? '（' + names.join(' / ') + '）' : '') + '· 参数 ' + argsChars + ' 字符（不展开）'))
+					}
+					if (typeof detail.images === 'number' && detail.images > 0) rows.push(el('div', { className: 'cbv-ctx-detail-note', key: 'images' }, '图片 ×' + detail.images))
+					return rows.length > 0 ? rows : [el('div', { className: 'cbv-ctx-detail-note', key: 'p30' }, '这一项没有可展开的内容。')]
+				}
+				if (state.category === 'tool') {
+					if (typeof detail.toolName === 'string' && detail.toolName !== '') rows.push(el('div', { className: 'cbv-ctx-detail-label', key: 'toolname' }, detail.toolName))
+					if (typeof detail.text === 'string' && detail.text !== '') {
+						rows.push(el('div', { className: 'cbv-ctx-detail-text', key: 'text' }, detail.text))
+						if (detail.textTruncated === true) rows.push(truncNoteOf(detail.textChars, '结果'))
+					}
+					return rows.length > 0 ? rows : [el('div', { className: 'cbv-ctx-detail-note', key: 'p30' }, '这一项没有可展开的内容。')]
+				}
+				// 用户 / 注入 / 技能：一段全文（不解析 markdown）。
+				if (state.category === 'inject') {
+					const label = text(detail.marker) !== '' ? text(detail.marker) : text(detail.kind)
+					if (label !== '') rows.push(el('div', { className: 'cbv-ctx-detail-label', key: 'kind' }, label))
+				}
+				if (typeof detail.text === 'string' && detail.text !== '') {
+					rows.push(el('div', { className: 'cbv-ctx-detail-text', key: 'text' }, detail.text))
+					if (detail.textTruncated === true) rows.push(truncNoteOf(detail.textChars, '正文'))
+				}
+				return rows.length > 0 ? rows : [el('div', { className: 'cbv-ctx-detail-note', key: 'p30' }, '这一项没有可展开的内容。')]
+			}
+
+			/** 一条可折叠的逐项行：收起 = 摘要一行 button；展开 = 行下插详情块（同卡、不弹层）。 */
+			const itemRowOf = (spec, item, index) => {
+				const seq = typeof item.seq === 'number' ? item.seq : null
+				if (seq === null) return el('div', { className: 'cbv-ctx-row-item', key: 'item' + index }, el('div', { className: 'cbv-ctx-row cbv-ctx-row--static' }, el('span', { className: 'cbv-ctx-row-text', key: 'text' }, ctxDigestTextOf(item))))
+				const open = openItem !== null && openItem.seq === seq
+				const detailId = 'item-d-' + seq
+				const metaKids = [ctxApproxOf(typeof item.tokens === 'number' ? item.tokens : null)]
+				metaKids.push(' · ')
+				metaKids.push(el('span', { className: 'cbv-ctx-row-seq', key: 'seq' }, 'seq ' + seq))
+				return el(
+					'div',
+					{ className: 'cbv-ctx-row-item', key: 'item' + index, 'data-ctx-row-item': '' + seq },
+					el(
+						'button',
+						{
+							className: 'cbv-ctx-row',
+							type: 'button',
+							'aria-expanded': open ? 'true' : 'false',
+							'aria-controls': detailId,
+							'aria-busy': open && openItem.status === 'loading' ? 'true' : undefined,
+							'data-ctx-row': '' + seq,
+							onClick: () => toggleItemOf(seq),
+						},
+						inheritBadgeOf(item),
+						el('span', { className: 'cbv-ctx-row-text', key: 'text' }, ctxDigestTextOf(item)),
+						el('span', { className: 'cbv-ctx-row-meta', key: 'meta' }, ...metaKids),
+						el('span', { className: 'cbv-ctx-row-caret', key: 'caret', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
+					),
+					el(
+						'div',
+						{ className: 'cbv-ctx-row-detail', id: detailId, key: 'detail', role: 'group', 'aria-label': '条目详情', hidden: open ? undefined : true, 'data-ctx-row-detail': open ? openItem.status : undefined },
+						...(open ? itemDetailNodesOf(openItem) : []),
+					),
+				)
+			}
+
+			/** 工具段：三列 + 三档排序 chip（只作用于当前段，不发请求）。 */
+			const toolRowsOf = () => {
+				const shown = typeof shownCount.tools === 'number' ? shownCount.tools : CTX_PAGE_SIZE
+				const list = sortedTools.slice(0, shown)
+				const sorts = [
+					{ key: 'size', label: '按大小' },
+					{ key: 'count', label: '按次数' },
+					{ key: 'name', label: '按名称' },
+				]
+				return [
+					el(
+						'div',
+						{ className: 'cbv-ctx-sort', key: 'sort', role: 'group', 'aria-label': '工具排序' },
+						sorts.map((item) =>
+							el(
+								'button',
+								{
+									className: 'cbv-flt-chip' + (sort === item.key ? ' cbv-flt-chip--on' : ''),
+									key: item.key,
+									type: 'button',
+									'aria-pressed': sort === item.key ? 'true' : 'false',
+									'data-ctx-sort': item.key,
+									onClick: () => setSort(item.key),
+								},
+								item.label,
+							),
+						),
+					),
+					...list.map((tool, index) =>
+						// 工具定义**不可展开**：非 button、无 caret、行尾 P29、title P32（不给假入口）。
+						el(
+							'div',
+							{ className: 'cbv-ctx-row-item', key: 'tool' + index, 'data-ctx-tool': text(tool.name) },
+							el(
+								'div',
+								{ className: 'cbv-ctx-row cbv-ctx-row--static cbv-ctx-row--dense', title: '这一项只有 schema 估算值，没有原文。' },
+								el('span', { className: 'cbv-ctx-row-text', key: 'name' }, text(tool.name) === '' ? '(无名)' : text(tool.name)),
+								el('span', { className: 'cbv-ctx-row-meta', key: 'meta' }, ctxApproxOf(typeof tool.tokens === 'number' ? tool.tokens : null) + ' · ×' + text(tool.calls)),
+								el('span', { className: 'cbv-ctx-row-nodetail', key: 'nodetail' }, '无详情'),
+							),
+						),
+					),
+					sortedTools.length > shown
+						? el(
+								'button',
+								{
+									className: 'cbv-btn cbv-ctx-more',
+									key: 'more',
+									type: 'button',
+									onClick: () => setShownCount((current) => ({ ...current, tools: shown + CTX_PAGE_SIZE })),
+								},
+								CTX_TEXT.more(shown, sortedTools.length),
+							)
+						: null,
+				]
+			}
+
+			/** 系统提示段：预览（P15/P20）→ 全文三态；无预览时走 P23 兜底（不画 P15/P20）。 */
+			const systemRowsOf = () => {
+				const list = itemsOf('system')
+				const item = list.length > 0 ? list[0] : null
+				if (item === null) return [el('div', { className: 'cbv-ctx-item', key: 'none' }, el('span', { className: 'cbv-ctx-item-text', key: 'text' }, CTX_TEXT.emptySegment))]
+				const chars = typeof item.chars === 'number' ? item.chars : null
+				const paragraphs = typeof item.paragraphs === 'number' ? item.paragraphs : null
+				const preview = text(item.preview)
+				const meta = ctxApproxOf(item.tokens) + (chars !== null ? ' · 共 ' + chars + ' 字符' : '')
+				const rows = [
+					el(
+						'div',
+						{ className: 'cbv-ctx-item', key: 'whole' },
+						inheritBadgeOf(item),
+						el('span', { className: 'cbv-ctx-item-text', key: 'text' }, '系统提示词整篇'),
+						el('span', { className: 'cbv-ctx-item-meta', key: 'meta' }, meta),
+					),
+				]
+				if (preview.trim() === '') {
+					// 态 2：没有可读首段 ⇒ 只给兜底句，不画 P15 / P20（拿"读不到"当一次失败动作更糟）。
+					rows.push(el('div', { className: 'cbv-ctx-empty', key: 'nopreview', 'data-ctx-no-preview': '' }, CTX_TEXT.noPreview))
+					return rows
+				}
+				rows.push(el('div', { className: 'cbv-ctx-preview', key: 'preview' }, preview))
+				rows.push(el('div', { className: 'cbv-ctx-preview-note', key: 'p15' }, ctxSystemNoteOf(chars, paragraphs)))
+				rows.push(
+					el(
+						'button',
+						{
+							className: 'cbv-btn cbv-ctx-action',
+							key: 'p20',
+							type: 'button',
+							ref: actionRef,
+							'aria-expanded': fulltext.status === 'idle' ? 'false' : 'true',
+							'aria-controls': 'ctx-system-fulltext',
+							'aria-busy': fulltext.status === 'loading' ? 'true' : undefined,
+							disabled: fulltext.status === 'loading',
+							onClick: () => toggleFulltextOf(),
+						},
+						fulltext.status === 'loading' ? '正在读取全文…' : '查看全文',
+					),
+				)
+				const fullKids = []
+				if (fulltext.status === 'loading') {
+					fullKids.push(el('div', { className: 'cbv-ctx-skel', key: 'sk0' }), el('div', { className: 'cbv-ctx-skel', key: 'sk1' }), el('div', { className: 'cbv-ctx-skel', key: 'sk2' }))
+				} else if (fulltext.status === 'error') {
+					fullKids.push(
+						el(
+							'div',
+							{ className: 'cbv-ctx-empty', key: 'p22' },
+							'读不到系统提示全文（' + (fulltext.error === '' ? '原因读不到' : fulltext.error) + '）；上面是首段预览。',
+						),
+						el('button', { className: 'cbv-btn cbv-ctx-action', key: 'retry-full', type: 'button', onClick: () => loadFulltextOf(true) }, '重试'),
+					)
+				} else if (fulltext.status === 'ready') {
+					if (fulltext.truncated === true) {
+						fullKids.push(
+							el('div', { className: 'cbv-ctx-fulltext-note', key: 'p21' }, '原文 ' + (typeof fulltext.chars === 'number' ? fulltext.chars : '') + ' 字符，这里只显示前 200,000 字符。'),
+						)
+					}
+					fullKids.push(el('pre', { className: 'cbv-ctx-fulltext-body', key: 'body', ref: fulltextRef, tabIndex: -1, 'aria-label': '系统提示词全文' }, fulltext.text))
+				}
+				rows.push(
+					el(
+						'div',
+						{ className: 'cbv-ctx-fulltext', id: 'ctx-system-fulltext', key: 'fulltext', hidden: fulltext.status === 'idle' ? true : undefined, 'data-fulltext': fulltext.status },
+						...fullKids,
+					),
+				)
+				return rows
+			}
+
+			/** 当前选中段的详情区（只渲染这一段；切段零请求）。 */
+			const detailBodyOf = () => {
+				if (selectedSpec === null) return [el('div', { className: 'cbv-ctx-empty', key: 'noseg' }, CTX_TEXT.emptySegment)]
+				if (selectedSpec.key === 'system') return systemRowsOf()
+				if (selectedSpec.key === 'tools') return toolRowsOf()
+				const list = itemsOf(selectedSpec.key)
+				if (list.length === 0) return [el('div', { className: 'cbv-ctx-empty', key: 'none' }, CTX_TEXT.emptySegment)]
+				const shown = typeof shownCount[selectedSpec.key] === 'number' ? shownCount[selectedSpec.key] : CTX_PAGE_SIZE
+				const total = totalOf(selectedSpec.key)
+				const rows = list.slice(0, shown).map((item, index) => itemRowOf(selectedSpec, item, index))
+				if (total > shown) {
+					rows.push(
+						el(
+							'button',
+							{
+								className: 'cbv-btn cbv-ctx-more',
+								key: 'more',
+								type: 'button',
+								onClick: () => setShownCount((current) => ({ ...current, [selectedSpec.key]: shown + CTX_PAGE_SIZE })),
+							},
+							CTX_TEXT.more(shown, total),
+						),
+					)
+				}
+				return rows
+			}
+
+			/** 左栏七行（垂直 tablist；roving tabindex）。 */
+			const toc = el(
+				'div',
+				{ className: 'cbv-ctx-toc', key: 'toc', ref: tocRef, role: 'tablist', 'aria-orientation': 'vertical', 'aria-label': '分段', onKeyDown: onTocKeyDown },
+				visibleSegments.map((spec) =>
+					el(
+						'button',
+						{
+							className: 'cbv-ctx-toc-item',
+							key: spec.key,
+							id: 'ctx-tab-' + spec.key,
+							type: 'button',
+							role: 'tab',
+							'aria-selected': selectedKey === spec.key ? 'true' : 'false',
+							'data-ctx-seg': spec.key,
+							'aria-controls': panelId,
+							tabIndex: selectedKey === spec.key ? 0 : -1,
+							onClick: () => openDetailPaneOf(spec.key),
+						},
+						el('span', { className: 'cbv-ctx-toc-sw', key: 'sw', 'aria-hidden': 'true', style: { background: spec.swatch } }),
+						el('span', { className: 'cbv-ctx-toc-name', key: 'name' }, spec.label),
+						el('span', { className: 'cbv-ctx-toc-count', key: 'count' }, countOf(spec.key) + ' 项'),
+						el('span', { className: 'cbv-ctx-toc-token', key: 'token' }, ctxApproxOf(tokensOf(spec.key))),
+						el('span', { className: 'cbv-ctx-toc-pct', key: 'pct' }, ctxShareOf(tokensOf(spec.key), allTotal)),
+					),
+				),
+			)
+
+			// 右栏唯一 tabpanel：段头 + 逐项（`aria-labelledby` 随选中换）。
+			const digest = selectedSpec === null ? null : ctxSegmentDigestOf(data, selectedSpec.key)
+			const detail = el(
+				'div',
+				{ className: 'cbv-ctx-detail', key: 'detail', id: panelId, role: 'tabpanel', 'aria-labelledby': 'ctx-tab-' + selectedKey, tabIndex: 0 },
+				el('button', { className: 'cbv-btn cbv-ctx-backlist', key: 'backlist', type: 'button', onClick: () => backToListOf() }, '‹ 列表'),
+				selectedSpec === null
+					? null
+					: el(
+							'div',
+							{ className: 'cbv-ctx-detail-head', key: 'head' },
+							el('span', { className: 'cbv-ctx-detail-sw', key: 'sw', 'aria-hidden': 'true', style: { background: selectedSpec.swatch } }),
+							el('h2', { className: 'cbv-ctx-detail-name', key: 'name', ref: detailHeadRef, tabIndex: -1 }, selectedSpec.label),
+							el('span', { className: 'cbv-ctx-detail-count', key: 'count' }, countOf(selectedSpec.key) + ' 项'),
+							el('span', { className: 'cbv-ctx-detail-token', key: 'token' }, ctxApproxOf(tokensOf(selectedSpec.key))),
+							el('span', { className: 'cbv-ctx-detail-share', key: 'share' }, ctxShareOf(tokensOf(selectedSpec.key), allTotal)),
+							digest !== null && typeof digest.noText === 'number' && digest.noText > 0
+								? el('span', { className: 'cbv-ctx-detail-digest', key: 'digest' }, '· 有正文 ' + (typeof digest.withText === 'number' ? digest.withText : 0) + ' · 仅推理/工具 ' + digest.noText)
+								: null,
+						),
+				el('div', { className: 'cbv-ctx-detail-body', key: 'body', ref: detailBodyRef }, ...detailBodyOf()),
+			)
+
+			// L1 / L2 / L3 与载入中：没有可比的主从结构，整块给说明（三段 / 空态 / 错误）。
+			let plainBody = null
+			if (loading) plainBody = el('div', { className: 'cbv-ctx-empty', key: 'loading' }, '正在读取上下文构成…')
+			else if (ctxState === 'l3') {
+				plainBody = el(
+					'div',
+					{ className: 'cbv-ctx-plain', key: 'l3' },
+					el('div', { className: 'cbv-ctx-empty', key: 'p10' }, CTX_TEXT.l3),
+					reason === '' ? null : el('div', { className: 'cbv-ctx-fulltext-note', key: 'reason', 'data-ctx-error': '' }, '原因：' + reason),
+					el('div', { className: 'cbv-ctx-item', key: 'session' }, el('span', { className: 'cbv-ctx-item-text', key: 'k' }, '会话'), el('span', { className: 'cbv-ctx-item-meta', key: 'v' }, text(row.session) === '' ? '—' : text(row.session))),
+					el('div', { className: 'cbv-ctx-item', key: 'model' }, el('span', { className: 'cbv-ctx-item-text', key: 'k' }, '模型'), el('span', { className: 'cbv-ctx-item-meta', key: 'v' }, text(row.model) === '' ? '—' : text(row.model))),
+					el('div', { className: 'cbv-ctx-item', key: 'provider' }, el('span', { className: 'cbv-ctx-item-text', key: 'k' }, '提供者'), el('span', { className: 'cbv-ctx-item-meta', key: 'v' }, text(row.provider) === '' ? '—' : text(row.provider))),
+				)
+			} else if (ctxState === 'l2') {
+				plainBody = el('div', { className: 'cbv-ctx-empty', key: 'l2', title: snapshot.phase === 'error' && reason !== '' ? reason : undefined }, CTX_TEXT.l2)
+			} else {
+				// L1：只给三段构成；原因原文一行（不美化）。
+				const segs = data !== null && data.segments !== null && data.segments !== undefined && typeof data.segments === 'object' ? data.segments : segments
+				const rows = [
+					el('div', { className: 'cbv-ctx-empty', key: 'l1' }, CTX_TEXT.l1(reason === '' ? '原因读不到' : reason)),
+				]
+				if (segs !== null && segs !== undefined) {
+					for (const item of [
+						{ key: 'system', label: '系统提示', swatch: 'var(--dsw-alias-chart-system)', tokens: segs.system },
+						{ key: 'tools', label: '工具', swatch: 'var(--dsw-alias-chart-tools)', tokens: segs.tools },
+						{ key: 'messages', label: '历史与其余', swatch: 'var(--dsw-alias-chart-messages)', tokens: segs.messages },
+					]) {
+						if (typeof item.tokens !== 'number' || item.tokens <= 0) continue
+						rows.push(
+							el(
+								'div',
+								{ className: 'cbv-ctx-item', key: item.key },
+								el('span', { className: 'cbv-ctx-seg-sw', key: 'sw', 'aria-hidden': 'true', style: { background: item.swatch } }),
+								el('span', { className: 'cbv-ctx-item-text', key: 'text' }, item.label),
+								el('span', { className: 'cbv-ctx-item-meta', key: 'meta' }, ctxApproxOf(item.tokens)),
+							),
+						)
+					}
+				}
+				plainBody = el('div', { className: 'cbv-ctx-plain', key: 'l1' }, ...rows)
+			}
+
+			// 人要求（2026-11-26）：页脚不再展示「构成是估算…」「逐工具之和…」「读数截至 … · 读数不会自动刷新」那一段。
+			// 保留的只有两种：⑩ 对账差额（Δ≠0 才画）与读不到时的原因原文（排障用）。
+			const footKids = [
+				ctxState === 'ready' && reconcileDelta !== 0
+					? el('div', { key: 'p14', 'data-ctx-reconcile': '' + reconcileDelta }, '构成合计比卡片上的多 ' + ctxTokenTextOf(reconcileDelta) + ' token：卡片用宿主的压缩记账，本页按当前内容重算（见设计 §1.10）。')
+					: null,
+				snapshot.phase === 'error' && reason !== '' ? el('div', { key: 'error-reason', 'data-ctx-error': '' }, '原因：' + reason) : null,
+				// 已结束成员的数据是冻结的：只保留这一句（它不是被要求删掉的那段"读数截至 + 不会自动刷新"）。
+				data !== null && data.ended === true ? el('div', { key: 'asof' }, '读数为最后落盘时刻') : null,
+			].filter(Boolean)
+
+			return el(
+				'div',
+				{
+					className: 'cbv-view cbv-ctx-page' + (motion === 'idle' ? '' : ' is-animating'),
+					ref: rootRef,
+					role: 'region',
+					'aria-labelledby': titleId,
+					'aria-busy': motion === 'idle' ? 'false' : 'true',
+					'data-ctx-state': ctxState === '' ? undefined : ctxState,
+					'data-ctx-pane': pane,
+					'data-ctx-motion': motion,
+					'data-motion': motion,
+					'data-ctx-member': text(row.session),
+				},
+				el(
+					'div',
+					{ className: 'cbv-ctx-flip', key: 'flip', ref: flipRef, 'data-ctx-pane': pane },
+					head,
+					banner,
+					summary,
+					el(
+						'div',
+						{ className: 'cbv-ctx-page-main' + (masterDetail ? '' : ' cbv-ctx-page-main--plain'), key: 'main' },
+						...(masterDetail ? [toc, detail] : [el('div', { className: 'cbv-ctx-plain', key: 'plain' }, plainBody)]),
+					),
+					footKids.length === 0 ? null : el('div', { className: 'cbv-ctx-page-foot', key: 'foot' }, ...footKids),
+				),
+			)
+		}

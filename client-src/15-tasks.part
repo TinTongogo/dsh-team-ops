@@ -1,0 +1,229 @@
+		// ── ⑮ 任务看板块 ───────────────────────────────────────────────────
+		function LedgerView(props) {
+			const spec = props.spec
+			// 作为首屏的「展开明细」内嵌时不重复占输入框槽：同一个槽 id 注册两次，谁压谁不好说。
+			useComposerHidden(props.hideComposer === false ? null : props.slots === undefined ? null : props.slots)
+			// 每次渲染现取一次：服务迟到时也能在下一轮渲染接上（同一服务的引用是稳定的，
+			// 所以下面那句 useEffect 的依赖不会来回变）。
+			const store = props.sessions === undefined ? null : typeof props.sessions === 'function' ? props.sessions() : props.sessions
+			const workspace = useCurrentWorkspace(store)
+			// **同一套拼法**：宿主拿不到工作区时会按会话回落 —— 手拼只带 workspace 的那一版少了那条路。
+			const sessionId = useCurrentSessionId(store)
+			const target = spec.endpoint + paneQueryOf(workspace, sessionId)
+			const [snapshot, setSnapshot] = React.useState({ phase: 'loading' })
+			const [query, setQuery] = React.useState('')
+			const [facet, setFacet] = React.useState('all')
+			// 详情浮窗：null = 关着；否则是正在看的那一条的编号（按编号从当前数据里取，保证数据是新的）。
+			const [detail, setDetail] = React.useState(null)
+			// 批准 / 驳回的确认流与详情浮窗都走**共用**那一份（详情浮窗里也是同一套）。
+
+			React.useEffect(() => {
+				let cancelled = false
+				if (typeof fetch !== 'function') {
+					setSnapshot({ phase: 'error', error: '当前环境没有 fetch' })
+					return () => {}
+				}
+				getJsonCached(target)
+					.then((response) =>
+						response.json().then(
+							(payload) => ({ response, payload }),
+							() => ({ response, payload: null }),
+						),
+					)
+					.then(({ response, payload }) => {
+						if (cancelled) return
+						if (payload === null) {
+							setSnapshot({ phase: 'error', error: 'HTTP ' + response.status + '：响应不是 JSON' })
+							return
+						}
+						if (payload.ok === true) {
+							setSnapshot({ phase: 'ready', data: payload })
+							return
+						}
+						const detail = typeof payload.error === 'string' ? payload.error : 'HTTP ' + response.status
+						setSnapshot({ phase: 'error', error: detail })
+					})
+					.catch((error) => {
+						if (cancelled) return
+						setSnapshot({ phase: 'error', error: '' + error })
+					})
+				return () => {
+					cancelled = true
+				}
+			// props.reload：面板的重读计数（切块 / 窗口回到前台 / 面板重新可见时 +1）。
+			}, [props.reload, target])
+
+			// 浮窗的键盘 / 焦点行为（Esc 关、← → **切换分栏**、打开后聚焦）走共用那一份。
+			const navRef = React.useRef({ ordered: [], index: -1 })
+			const modalRef = useDetailModal(detail, () => setDetail(null), (offset) => step(offset), (offset) => columnStep(offset))
+
+			const data = snapshot.phase === 'ready' ? snapshot.data : null
+			const absent = data !== null && data.absent === true
+			const items = data !== null && Array.isArray(data.items) ? data.items : []
+			const facetValues = facetValuesOf(items, spec.facetField)
+
+			const needle = query.trim().toLowerCase()
+			const filtered = []
+			for (let i = 0; i < items.length; i++) {
+				const item = items[i]
+				if (facet !== 'all' && '' + item[spec.facetField] !== facet) continue
+				if (needle.length > 0 && haystackOf(item).indexOf(needle) === -1) continue
+				filtered.push(item)
+			}
+			// 栏从哪来：默认按 `status` 分（`bucketsOf`）；`spec.columnsOf` 给了就听它的 ——
+			// 里程碑那一档就是这样把栏换成 `phase`（同一套取数 / 筛选 / 详情翻页，只换分栏轴）。
+			const customColumns = typeof spec.columnsOf === 'function'
+			const rawColumns = customColumns ? spec.columnsOf(filtered, spec) : bucketsOf(filtered, spec)
+			const columns = rawColumns.map((column) => ({
+				key: column.key ?? column.name,
+				label: column.label ?? spec.statusLabel(column.name),
+				tone: column.tone ?? spec.tone(column.name),
+				note: column.note,
+				flagged: column.flagged === true,
+				// 「枚举外的状态」这一档**只在默认（按状态分栏）时有意义**：按 `phase` 分栏时，
+				// "没登记的阶段"另有栏上那个标记说（两件事不混成一句）。
+				canonical: column.canonical !== false,
+				// 空栏那句话可以由 `spec.columnsOf` 给（"这一批还没有条目" vs "清单里已登记但还没活"）。
+				emptyText: column.emptyText,
+				items: column.items,
+			}))
+			// 浮窗里翻页只在"当前这一项所属的那一栏"内走动，不跨栏：顺序 = 该栏在屏幕上的栏内序，不是状态文件里的顺序。
+			const orderedItems = []
+			if (detail !== null) {
+				for (let i = 0; i < columns.length; i++) {
+					// 先认出这一项属于哪一栏，再只把那一栏的条目放进来；认不出（例如被筛选挡掉）就留空，两个按钮都不可点。
+					let mine = false
+					for (let j = 0; j < columns[i].items.length && !mine; j++) mine = text(columns[i].items[j].id) === detail.id
+					if (mine) {
+						for (let j = 0; j < columns[i].items.length; j++) orderedItems.push(columns[i].items[j])
+						break
+					}
+				}
+			}
+			const detailIndex = detail === null ? -1 : orderedItems.findIndex((entry) => text(entry.id) === detail.id)
+			// 键盘翻页要在 keydown 回调里读"当前这一份"：用 ref 承载，免得把每次渲染都变的数组写进依赖。
+			navRef.current = { ordered: orderedItems, index: detailIndex }
+			const step = (offset) => {
+				const current = navRef.current
+				const at = current.index + offset
+				if (at < 0 || at >= current.ordered.length) return
+				setDetail({ id: text(current.ordered[at].id) })
+			}
+
+			/**
+			 * **切换分栏**（← → 用的那一步）：从当前项所在栏往 `offset` 方向走，遇到空栏跳过，
+			 * 落在那一栏里**同一个位置**（不够就落在它最后一个）；到底了就不动。
+			 */
+			const columnStep = (offset) => {
+				const at = columns.findIndex((column) => column.items.some((entry) => text(entry.id) === detail.id))
+				if (at < 0) return
+				const mineAt = columns[at].items.findIndex((entry) => text(entry.id) === detail.id)
+				for (let i = at + offset; i >= 0 && i < columns.length; i += offset) {
+					const list = columns[i].items
+					if (list.length === 0) continue
+					const target = list[Math.min(Math.max(mineAt, 0), list.length - 1)]
+					setDetail({ id: text(target.id) })
+					return
+				}
+			}
+
+			const nonCanonical = []
+			if (!customColumns) {
+				for (let i = 0; i < columns.length; i++) {
+					if (!columns[i].canonical) nonCanonical.push(columns[i].label + '(' + columns[i].items.length + ')')
+				}
+			}
+
+			let body = null
+			if (snapshot.phase === 'loading') {
+				body = el('div', { className: 'cbv-msg', key: 'body' }, '正在读取文件…')
+			} else if (snapshot.phase === 'error') {
+				body = el('div', { className: 'cbv-msg cbv-msg--error', key: 'body' }, '读取失败：' + snapshot.error)
+			} else if (absent) {
+				body = el(
+					'div',
+					{ className: 'cbv-pane-empty', key: 'body' },
+					'这个工作区还没有这份文件：' + (typeof data.path === 'string' ? data.path : '') + '（有内容后自动出现，无需刷新。）',
+				)
+			} else if (columns.length === 0) {
+				body = el('div', { className: 'cbv-pane-empty', key: 'body' }, '没有匹配的条目（文件共 ' + (data === null ? 0 : data.total) + ' 条）。')
+			} else {
+				const card = CARDS[spec.ledger]
+				body = el(
+					'div',
+					{ className: 'cbv-board', key: 'body' },
+					columns.map((column) =>
+						el(
+							'div',
+							{ className: 'cbv-col', key: column.key, 'data-col-key': column.key, ...(column.flagged ? { 'data-col-flagged': 'true' } : {}) },
+							el(
+								'div',
+								{ className: 'cbv-col-head', key: 'head' },
+								el('span', { className: 'cbv-dot', key: 'dot', style: { backgroundColor: TONE_VAR[column.tone] } }),
+								el('span', { className: 'cbv-col-name', key: 'name' }, column.label),
+								el('span', { className: 'cbv-col-count', key: 'count' }, '' + column.items.length),
+								column.flagged ? el('span', { className: 'cbv-chip cbv-chip--exception', key: 'flag' }, '未登记进里程碑清单') : null,
+							),
+							// 栏头下面那一句（里程碑那一档用来印出口准则 / 清单登记状态）；没有就不占行。
+							column.note === undefined || column.note === null || column.note === ''
+								? null
+								: el('div', { className: 'cbv-col-note', key: 'note' }, column.note),
+							el(
+								'div',
+								{ className: 'cbv-col-body', key: 'body' },
+								column.items.length === 0
+									? el('div', { className: 'cbv-empty', key: 'empty' }, column.emptyText ?? '暂无')
+									: column.items.map((item, index) => {
+											const cardKey = column.key + '#' + index + '#' + text(item.id)
+											return card(item, false, () => setDetail({ id: text(item.id) }), cardKey, spec.cardOptions)
+										}),
+							),
+						),
+					),
+				)
+			}
+
+			// 不再有"栏头"分支（本包只有面板内嵌这一种用法，`showHeader:false`）；半死代码会误导后续改动。
+			const embedded = props.showHeader === false
+			return el(
+				'div',
+				{ className: embedded ? 'cbv-root cbv-root--embed' : 'cbv-root', ...(embedded ? {} : { 'data-team-ops-pane': '' }) },
+				nonCanonical.length > 0
+					? el('div', { className: 'cbv-note', key: 'warn' }, '文件里存在不属于引擎枚举的状态，已单列显示：' + nonCanonical.join('、'))
+					: null,
+				el(
+					'div',
+					{ className: 'cbv-flt-bar', key: 'filters' },
+					// 调用方塞进来的**前置 chip**（看板块的来源分档就是它）：与成员/技能那一条筛选行
+					// 合成同一条 —— 四块都只有"一条筛选行"，不再有一块是另画的输入行。
+					props.leadingFilter === undefined || props.leadingFilter === null ? null : props.leadingFilter,
+					el('span', { className: 'cbv-spacer', key: 'spacer' }),
+					el(
+						'select',
+						{ className: 'cbv-flt-select cbv-select', key: 'facet', value: facet, 'aria-label': spec.facetAll, onChange: (event) => setFacet(event.target.value) },
+						el('option', { value: 'all' }, spec.facetAll),
+						facetValues.map((value) => el('option', { key: value, value }, value)),
+					),
+					el('input', {
+						className: 'cbv-flt-search cbv-input',
+						key: 'query',
+						type: 'text',
+						placeholder: spec.searchHint,
+						'aria-label': '搜索',
+						value: query,
+						onChange: (event) => setQuery(event.target.value),
+					}),
+				),
+				body,
+				detail === null
+					? null
+					: (() => {
+							const current = items.filter((entry) => text(entry.id) === detail.id)[0]
+							if (current === undefined) return null
+							// 浮窗本体走共用那一份（detailOverlayOf）：翻页在**该条所在那一栏**内走。
+							return detailOverlayOf(spec, current, orderedItems, detailIndex, step, () => setDetail(null), modalRef, labelOfColumn(columns, current))
+						})(),
+			)
+		}
+
+		/** 插入本插件自己的样式表；随 Plugin 一起销毁。 */

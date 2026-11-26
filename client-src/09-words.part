@@ -1,0 +1,96 @@
+		// ── ⑨ 词表与分栏规格 ─────────────────────────────────────────────────
+		/**
+		 * 「成员」块的分档 chip：这样几枚**是筛选条件，不是一份划分** —— 各档条数各算各的，
+		 * 加起来可以大于「全部」（一枚 chip 上的数只回答"按这一档筛能筛出几条"）。
+		 *
+		 * **只有三档**（task-40，人的决定）：`全部` / `协调者` / `已停用`。
+		 * 从前那两档「在册 / 未入册」的判据只是"这一位在不在我们的旧名册文件 `.ops/members.json` 里"
+		 * —— 那份文件早没人写（人机器上 0 行）⇒ 「在册」空着、**所有成员统统落进「未入册」**，语义正好相反；
+		 * 那份旧账连同这两档一起撤掉，面板**不再读那个文件**。
+		 * `已停用` 读的是**我们自己的真源**：载荷里每行的 `disabled`（来自工作区文件 `.ops/member-flags.json`，
+		 * 就是「停用」那三个动词用的同一份），**不是**旧名册里的 `enabled` 历史字段。
+		 */
+		const MEMBER_STAGES = [
+			{ key: 'all', label: '全部', match: () => true },
+			{ key: 'lead', label: '协调者', match: (row) => text(row.kind) === 'lead' },
+			{ key: 'disabled', label: '已停用', match: (row) => row.disabled === true },
+		]
+		/**
+		 * 本会话团队任务板的**三栏**（原生 `task.status` 原样映射，不是把它的状态折进我们那五栏）。
+		 *
+		 * 两套制度的长相不一样，这里不发明映射表：原生是 `pending / in_progress / completed`
+		 * （`deleted` 是墓碑，`listTasks` 不返回），我们是 待办 / 进行中 / 待验收 / 已完成 / 已打回。
+		 * 所以这一栏顶部有"来源分档"：各按各的栏看，谁也不装作对方。
+		 */
+		const TEAM_TASK_COLUMNS = [
+			{ key: 'pending', label: '待办' },
+			{ key: 'in_progress', label: '进行中' },
+			{ key: 'completed', label: '已完成' },
+		]
+
+		/**
+		 * 「被阻塞」的判据：**自己还没完成，且至少一个依赖任务还没完成**。
+		 *
+		 * 与「有依赖」是**两件事**（人的口径：依赖是事实，阻塞是状态）：
+		 *   · 有依赖 = `blockedBy` 非空 —— 声明过就是事实，依赖完成、任务完成都不会让它消失；
+		 *   · 被阻塞 = 此刻依赖没完成 —— 依赖都完成后就不再是"被阻塞"。
+		 * 原生只给了 `ready`（pending 且依赖全完成），没有单独的 blocked 字段 ⇒ 这里用同一份原生字段
+		 * （`blockedBy` + 各条的 `status`）推一次；**只在这一处推**（筛选 chip、卡片 chip、浮窗共用）。
+		 * 依赖的任务不在载荷里（被删 / 被截断 / 还没读到）⇒ 按"没完成"算（不假装已解除）。
+		 * @param row - 原生任务行。
+		 * @param statusById - 同载荷全部行的 `id → status`。
+		 * @returns 是否被未完成的依赖卡住。
+		 */
+		const dependencyBlockedOf = (row, statusById) => {
+			const blockedBy = Array.isArray(row.blockedBy) ? row.blockedBy : []
+			if (blockedBy.length === 0) return false
+			if (typeof row.status === 'string' && row.status === 'completed') return false
+			const lookup = statusById !== null && statusById !== undefined && typeof statusById.get === 'function' ? statusById : null
+			return blockedBy.some((id) => {
+				const key = typeof id === 'string' ? id : String(id ?? '')
+				const status = lookup === null ? undefined : lookup.get(key)
+				return status !== 'completed'
+			})
+		}
+
+		/**
+		 * 「任务看板」块的分档 chip：**从原生给的字段里选得出来的那几档**（都是筛选条件，不是划分）。
+		 *
+		 * 判据来源：
+		 *   · `可认领` 用原生的 `ready`（它自己算的"pending 且依赖都完成"）；
+		 *   · `被阻塞` 用 `blockedBy` + 各条 `status` 推（见 `dependencyBlockedOf`，与「有依赖」区分）；
+		 *   · `有依赖` 看 `blockedBy` 有没有内容（**事实**，与是否被卡住无关）；
+		 *   · `写盘面重叠` 看原生给的 `writeScopeWarnings` 有没有内容（那是它的告警原文，不是我们算的重叠）。
+		 * 原生载荷里**没有优先级、没有时间**（`/team-tasks` 返回的那几格就是全部）⇒ 卡上印不出来，
+		 * 这件事写在块头那句注解里，不留白让人以为是没显示。
+		 */
+		const TEAM_TASK_STAGES = [
+			{ key: 'all', label: '全部', match: () => true },
+			{ key: 'ready', label: '可认领', match: (row) => row.ready === true },
+			{ key: 'blocked', label: '被阻塞', match: (row, statusById) => dependencyBlockedOf(row, statusById) },
+			{ key: 'depends', label: '有依赖', match: (row) => Array.isArray(row.blockedBy) && row.blockedBy.length > 0 },
+			{ key: 'overlap', label: '写盘面重叠', match: (row) => Array.isArray(row.writeScopeWarnings) && row.writeScopeWarnings.length > 0 },
+		]
+
+		/**
+		 * 运行时状态（**内置 Agent Teams 名册那一份**，与 `list_agents` 同源）的中文说法。
+		 * `inactive` 也不等于"空闲可派"，所以词面用「无轮次」——与内置工具的回执同一套说法。
+		 */
+		const MEMBER_RUNTIME_WORDS = { running: '跑着', inactive: '无轮次', provisioning: '创建中', failed: '失败' }
+		/**
+		 * 技能来源（宿主注册表给的 `source` 键）的中文说法。
+		 *
+		 * **这只是给人看的标签**：判定与分组一律用端点原样给的 `source`（卡片上还留着
+		 * `data-skill-source` 与浮窗里的原文），所以这份表即使将来少一档，也只是回落成原文、
+		 * 不会把两种来源混成一种。
+		 */
+		const SKILL_SOURCE_WORDS = {
+			'project-dsh': '项目 .dsh/skills',
+			'project-agents': '项目 .agents/skills',
+			custom: '自定义目录',
+			'user-dsh': '用户 ~/.dsh/skills',
+			'user-agents': '用户 ~/.agents/skills',
+			bundled: '随包目录',
+			runtime: '运行时注册',
+		}
+
